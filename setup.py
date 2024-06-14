@@ -5,7 +5,7 @@ with open("README.md", "r") as fh:
   
 setuptools.setup(
   name="libauc",
-  version="1.3.0",
+  version="1.3.1",
   author="Zhuoning Yuan, Tianbao Yang",
   description="LibAUC: A Deep Learning Library for X-Risk Optimization",
   long_description=long_description,
@@ -17,7 +17,7 @@ setuptools.setup(
   "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
   "Operating System :: OS Independent",
   ],
-  python_requires=">=3.6",
+  python_requires=">=3.8",
   install_requires = [
                       'torch',
                       'torchvision',
@@ -27,5 +27,7 @@ setuptools.setup(
                       'pandas',
                       'Pillow',
                       'scikit-learn',
-                      'opencv-python']
+                      'opencv-python',
+                      'torch_geometric',
+                      'ogb']
 )

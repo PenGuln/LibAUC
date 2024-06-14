@@ -29,7 +29,7 @@ from torch_geometric.nn.resolver import (
 )
 
 
-__all__ = ['GCN', 'DeeperGCN', 'GIN', 'GINE', 'GAT', 'MPNN', 'GraphSAGE', 'PNA']
+__all__ = ['GCN', 'DeeperGCN', 'GIN', 'GINE', 'GAT', 'MPNN', 'GraphSAGE', 'PNA', 'AtomEncoder', 'BondEncoder']
 
 pooling_options = {"sum":global_add_pool,
                 "mean":global_mean_pool,
@@ -45,11 +45,8 @@ class GIN(BasicGNN):
         num_tasks (int): Number of tasks for multi-label classification. 
         emb_dim (int): Size of embedding for each atom and/or bond and graph.
         num_layers (int): Number of message passing layers.
-        atom_features_dims:(list or None, optional): Size of each category feature for atoms(nodes). if a list is not provided,
-        the atom_features_dims will be filled by funtion `get_atom_feature_dims() <https://github.com/snap-stanford/ogb/blob/master/ogb/utils/features.py>_`.
-        graph_pooling (str): Pooling function to generate whole-graph embeddings.
-        (:obj:`"mean"`, :obj:`"sum"`, :obj:`"max"`, :obj:`"attention"`,
-            :obj:`"set2set"`). (default: :obj:`"mean"`)
+        atom_features_dims:(list or None, optional): Size of each category feature for atoms(nodes). if a list is not provided, the atom_features_dims will be filled by funtion `get_atom_feature_dims() <https://github.com/snap-stanford/ogb/blob/master/ogb/utils/features.py>`_.
+        graph_pooling (str): Pooling function to generate whole-graph embeddings. (:obj:`"mean"`, :obj:`"sum"`, :obj:`"max"`, :obj:`"attention"`, :obj:`"set2set"`). (default: :obj:`"mean"`)
         dropout (float, optional): Dropout probability. (default: :obj:`0.5`)
         act (str or Callable, optional): The non-linear activation function to
             use. (default: :obj:`"relu"`)
@@ -153,14 +150,9 @@ class GINE(BasicGNN):
         num_tasks (int): Number of tasks for multi-label classification. 
         emb_dim (int): Size of embedding for each atom(node) and/or bond(edge) and graph.
         num_layers (int): Number of message passing layers.
-        atom_features_dims:(list or None, optional): Size of each category feature for atoms(nodes). if a list is not provided,
-        the atom_features_dims will be filled by funtion `get_atom_feature_dims() <https://github.com/snap-stanford/ogb/blob/master/ogb/utils/features.py>_`.
-        graph_pooling (str): Pooling function to generate whole-graph embeddings.
-        bond_features_dims:(list or None, optional): Size of each category feature for bonds(edges). if a list is not provided,
-        the bond_features_dims will be filled by funtion `get_bond_feature_dims() <https://github.com/snap-stanford/ogb/blob/master/ogb/utils/features.py>_`.
-        graph_pooling (str): Pooling function to generate whole-graph embeddings.
-        (:obj:`"mean"`, :obj:`"sum"`, :obj:`"max"`, :obj:`"attention"`,
-            :obj:`"set2set"`). (default: :obj:`"mean"`)
+        atom_features_dims:(list or None, optional): Size of each category feature for atoms(nodes). if a list is not provided, the atom_features_dims will be filled by funtion `get_atom_feature_dims() <https://github.com/snap-stanford/ogb/blob/master/ogb/utils/features.py>`_.
+        bond_features_dims:(list or None, optional): Size of each category feature for bonds(edges). if a list is not provided, the bond_features_dims will be filled by funtion `get_bond_feature_dims() <https://github.com/snap-stanford/ogb/blob/master/ogb/utils/features.py>`_.
+        graph_pooling (str): Pooling function to generate whole-graph embeddings. (:obj:`"mean"`, :obj:`"sum"`, :obj:`"max"`, :obj:`"attention"`, :obj:`"set2set"`). (default: :obj:`"mean"`)
         dropout (float, optional): Dropout probability. (default: :obj:`0.5`)
         act (str or Callable, optional): The non-linear activation function to
             use. (default: :obj:`"relu"`)
@@ -268,11 +260,8 @@ class GCN(BasicGNN):
         num_tasks (int): Number of tasks for multi-label classification. 
         emb_dim (int): Size of embedding for each atom and/or bond and graph.
         num_layers (int): Number of message passing layers.
-        atom_features_dims:(list or None, optional): Size of each category feature for atoms(nodes). if a list is not provided,
-        the `atom_features_dims` will be filled by funtion `get_atom_feature_dims() <https://github.com/snap-stanford/ogb/blob/master/ogb/utils/features.py>_`.
-        graph_pooling (str): Pooling function to generate whole-graph embeddings.
-        (:obj:`"mean"`, :obj:`"sum"`, :obj:`"max"`, :obj:`"attention"`,
-            :obj:`"set2set"`). (default: :obj:`"mean"`)
+        atom_features_dims:(list or None, optional): Size of each category feature for atoms(nodes). if a list is not provided, the `atom_features_dims` will be filled by funtion `get_atom_feature_dims() <https://github.com/snap-stanford/ogb/blob/master/ogb/utils/features.py>`_.
+        graph_pooling (str): Pooling function to generate whole-graph embeddings. (:obj:`"mean"`, :obj:`"sum"`, :obj:`"max"`, :obj:`"attention"`, :obj:`"set2set"`). (default: :obj:`"mean"`)
         dropout (float, optional): Dropout probability. (default: :obj:`0.5`)
         act (str or Callable, optional): The non-linear activation function to
             use. (default: :obj:`"relu"`)
@@ -375,14 +364,9 @@ class DeeperGCN(torch.nn.Module):
         num_tasks (int): Number of tasks for multi-label classification. 
         emb_dim (int): Size of embedding for each atom(node) and/or bond(edge) and graph.
         num_layers (int): Number of message passing layers.
-        atom_features_dims:(list or None, optional): Size of each category feature for atoms(nodes). if a list is not provided,
-        the atom_features_dims will be filled by funtion `get_atom_feature_dims() <https://github.com/snap-stanford/ogb/blob/master/ogb/utils/features.py>_`.
-        graph_pooling (str): Pooling function to generate whole-graph embeddings.
-        bond_features_dims:(list or None, optional): Size of each category feature for bonds(edges). if a list is not provided,
-        the bond_features_dims will be filled by funtion `get_bond_feature_dims() <https://github.com/snap-stanford/ogb/blob/master/ogb/utils/features.py>_`.
-        graph_pooling (str): Pooling function to generate whole-graph embeddings.
-        (:obj:`"mean"`, :obj:`"sum"`, :obj:`"max"`, :obj:`"attention"`,
-            :obj:`"set2set"`). (default: :obj:`"mean"`)
+        atom_features_dims:(list or None, optional): Size of each category feature for atoms(nodes). if a list is not provided, the atom_features_dims will be filled by funtion `get_atom_feature_dims() <https://github.com/snap-stanford/ogb/blob/master/ogb/utils/features.py>`_.
+        bond_features_dims:(list or None, optional): Size of each category feature for bonds(edges). if a list is not provided, the bond_features_dims will be filled by funtion `get_bond_feature_dims() <https://github.com/snap-stanford/ogb/blob/master/ogb/utils/features.py>`_.
+        graph_pooling (str): Pooling function to generate whole-graph embeddings. (:obj:`"mean"`, :obj:`"sum"`, :obj:`"max"`, :obj:`"attention"`, :obj:`"set2set"`). (default: :obj:`"mean"`)
         dropout (float, optional): Dropout probability. (default: :obj:`0.`)
         aggr (str or Aggregation, optional): The aggregation scheme to use.
             Any aggregation of :obj:`torch_geometric.nn.aggr` can be used,
@@ -497,17 +481,10 @@ class GAT(BasicGNN):
         num_tasks (int): Number of tasks for multi-label classification. 
         emb_dim (int): Size of embedding for each atom(node) and/or bond(edge) and graph.
         num_layers (int): Number of message passing layers.
-        v2 (bool, optional): If set to :obj:`True`, will make use of
-            :class:`~torch_geometric.nn.conv.GATv2Conv` rather than
-            :class:`~torch_geometric.nn.conv.GATConv`. (default: :obj:`False`)
-        atom_features_dims:(list or None, optional): Size of each category feature for atoms(nodes). if a list is not provided,
-        the atom_features_dims will be filled by funtion `get_atom_feature_dims() <https://github.com/snap-stanford/ogb/blob/master/ogb/utils/features.py>_`.
-        graph_pooling (str): Pooling function to generate whole-graph embeddings.
-        bond_features_dims:(list or None, optional): Size of each category feature for bonds(edges). if a list is not provided,
-        the bond_features_dims will be filled by funtion `get_bond_feature_dims() <https://github.com/snap-stanford/ogb/blob/master/ogb/utils/features.py>_`.
-        graph_pooling (str): Pooling function to generate whole-graph embeddings.
-        (:obj:`"mean"`, :obj:`"sum"`, :obj:`"max"`, :obj:`"attention"`,
-            :obj:`"set2set"`). (default: :obj:`"mean"`)
+        v2 (bool, optional): If set to :obj:`True`, will make use of: class:`~torch_geometric.nn.conv.GATv2Conv` rather than :class:`~torch_geometric.nn.conv.GATConv`. (default: :obj:`False`)
+        atom_features_dims:(list or None, optional): Size of each category feature for atoms(nodes). if a list is not provided, the atom_features_dims will be filled by funtion `get_atom_feature_dims() <https://github.com/snap-stanford/ogb/blob/master/ogb/utils/features.py>`_.
+        bond_features_dims:(list or None, optional): Size of each category feature for bonds(edges). if a list is not provided, the bond_features_dims will be filled by funtion `get_bond_feature_dims() <https://github.com/snap-stanford/ogb/blob/master/ogb/utils/features.py>`_.
+        graph_pooling (str): Pooling function to generate whole-graph embeddings. (:obj:`"mean"`, :obj:`"sum"`, :obj:`"max"`, :obj:`"attention"`, :obj:`"set2set"`). (default: :obj:`"mean"`)
         dropout (float, optional): Dropout probability. (default: :obj:`0.`)
         act (str or Callable, optional): The non-linear activation function to
             use. (default: :obj:`"relu"`)
@@ -631,14 +608,9 @@ class MPNN(BasicGNN):
         num_tasks (int): Number of tasks for multi-label classification. 
         emb_dim (int): Size of embedding for each atom(node) and/or bond(edge) and graph.
         num_layers (int): Number of message passing layers.
-        atom_features_dims:(list or None, optional): Size of each category feature for atoms(nodes). if a list is not provided,
-        the atom_features_dims will be filled by funtion `get_atom_feature_dims() <https://github.com/snap-stanford/ogb/blob/master/ogb/utils/features.py>_`.
-        graph_pooling (str): Pooling function to generate whole-graph embeddings.
-        bond_features_dims:(list or None, optional): Size of each category feature for bonds(edges). if a list is not provided,
-        the bond_features_dims will be filled by funtion `get_bond_feature_dims() <https://github.com/snap-stanford/ogb/blob/master/ogb/utils/features.py>_`.
-        graph_pooling (str): Pooling function to generate whole-graph embeddings.
-        (:obj:`"mean"`, :obj:`"sum"`, :obj:`"max"`, :obj:`"attention"`,
-            :obj:`"set2set"`). (default: :obj:`"mean"`)
+        atom_features_dims:(list or None, optional): Size of each category feature for atoms(nodes). if a list is not provided, the atom_features_dims will be filled by funtion `get_atom_feature_dims() <https://github.com/snap-stanford/ogb/blob/master/ogb/utils/features.py>`_.
+        bond_features_dims:(list or None, optional): Size of each category feature for bonds(edges). if a list is not provided, the bond_features_dims will be filled by funtion `get_bond_feature_dims() <https://github.com/snap-stanford/ogb/blob/master/ogb/utils/features.py>`_.
+        graph_pooling (str): Pooling function to generate whole-graph embeddings. (:obj:`"mean"`, :obj:`"sum"`, :obj:`"max"`, :obj:`"attention"`, :obj:`"set2set"`). (default: :obj:`"mean"`)
         dropout (float, optional): Dropout probability. (default: :obj:`0.2`)
         act (str or Callable, optional): The non-linear activation function to
             use. (default: :obj:`"relu"`)
@@ -745,11 +717,8 @@ class GraphSAGE(BasicGNN):
         num_tasks (int): Number of tasks for multi-label classification. 
         emb_dim (int): Size of embedding for each atom and/or bond and graph.
         num_layers (int): Number of message passing layers.
-        atom_features_dims:(list or None, optional): Size of each category feature for atoms(nodes). if a list is not provided,
-        the atom_features_dims will be filled by funtion `get_atom_feature_dims() <https://github.com/snap-stanford/ogb/blob/master/ogb/utils/features.py>_`.
-        graph_pooling (str): Pooling function to generate whole-graph embeddings.
-        (:obj:`"mean"`, :obj:`"sum"`, :obj:`"max"`, :obj:`"attention"`,
-            :obj:`"set2set"`). (default: :obj:`"mean"`)
+        atom_features_dims:(list or None, optional): Size of each category feature for atoms(nodes). if a list is not provided, the atom_features_dims will be filled by funtion `get_atom_feature_dims() <https://github.com/snap-stanford/ogb/blob/master/ogb/utils/features.py>`_.
+        graph_pooling (str): Pooling function to generate whole-graph embeddings. (:obj:`"mean"`, :obj:`"sum"`, :obj:`"max"`, :obj:`"attention"`, :obj:`"set2set"`). (default: :obj:`"mean"`)
         dropout (float, optional): Dropout probability. (default: :obj:`0.2`)
         act (str or Callable, optional): The non-linear activation function to
             use. (default: :obj:`"relu"`)
@@ -844,14 +813,9 @@ class PNA(BasicGNN):
         num_tasks (int): Number of tasks for multi-label classification. 
         emb_dim (int): Size of embedding for each atom(node) and/or bond(edge) and graph.
         num_layers (int): Number of message passing layers.
-        atom_features_dims:(list or None, optional): Size of each category feature for atoms(nodes). if a list is not provided,
-        the atom_features_dims will be filled by funtion `get_atom_feature_dims() <https://github.com/snap-stanford/ogb/blob/master/ogb/utils/features.py>_`.
-        graph_pooling (str): Pooling function to generate whole-graph embeddings.
-        bond_features_dims:(list or None, optional): Size of each category feature for bonds(edges). if a list is not provided,
-        the bond_features_dims will be filled by funtion `get_bond_feature_dims() <https://github.com/snap-stanford/ogb/blob/master/ogb/utils/features.py>_`.
-        graph_pooling (str): Pooling function to generate whole-graph embeddings.
-        (:obj:`"mean"`, :obj:`"sum"`, :obj:`"max"`, :obj:`"attention"`,
-            :obj:`"set2set"`). (default: :obj:`"mean"`)
+        atom_features_dims:(list or None, optional): Size of each category feature for atoms(nodes). if a list is not provided, the atom_features_dims will be filled by funtion `get_atom_feature_dims() <https://github.com/snap-stanford/ogb/blob/master/ogb/utils/features.py>`_.
+        bond_features_dims:(list or None, optional): Size of each category feature for bonds(edges). if a list is not provided, the bond_features_dims will be filled by funtion `get_bond_feature_dims() <https://github.com/snap-stanford/ogb/blob/master/ogb/utils/features.py>`_.
+        graph_pooling (str): Pooling function to generate whole-graph embeddings. (:obj:`"mean"`, :obj:`"sum"`, :obj:`"max"`, :obj:`"attention"`, :obj:`"set2set"`). (default: :obj:`"mean"`)
         dropout (float, optional): Dropout probability. (default: :obj:`0.2`)
         act (str or Callable, optional): The non-linear activation function to
             use. (default: :obj:`"relu"`)
@@ -947,6 +911,7 @@ class PNA(BasicGNN):
     
 
 class AtomEncoder(torch.nn.Module):
+    r"""Convert discrete atom(node) features to embeddings"""
     def __init__(self, emb_dim, atom_features_dims):
         super(AtomEncoder, self).__init__()
         self.atom_embedding_list = torch.nn.ModuleList()
@@ -970,6 +935,7 @@ class AtomEncoder(torch.nn.Module):
 
 
 class BondEncoder(torch.nn.Module):
+    r"""Convert discrete bond(edge) features to embeddings"""
     def __init__(self, emb_dim, bond_features_dims):
         super(BondEncoder, self).__init__()
 
