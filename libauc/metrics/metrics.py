@@ -8,7 +8,7 @@ def auc_roc_score(y_true, y_pred, reduction='mean', **kwargs):
     r"""Evaluation function of AUROC"""
     y_true = check_array_type(y_true)
     y_pred = check_array_type(y_pred)
-    num_labels = y_true.shape[-1] if len(y_true) == 2 else 1
+    num_labels = y_true.shape[-1] if len(y_true.shape) == 2 else 1
     y_true = check_array_shape(y_true, (-1, num_labels)) 
     y_pred = check_array_shape(y_pred, (-1, num_labels))
     assert reduction in ['mean', None, 'None'], 'Input is not valid!'
@@ -31,7 +31,7 @@ def auc_prc_score(y_true, y_pred, reduction='mean', **kwargs):
     r"""Evaluation function of AUPRC"""
     y_true = check_array_type(y_true)
     y_pred = check_array_type(y_pred)
-    num_labels = y_true.shape[-1] if len(y_true) == 2 else 1
+    num_labels = y_true.shape[-1] if len(y_true.shape) == 2 else 1
     y_true = check_array_shape(y_true, (-1, num_labels)) 
     y_pred = check_array_shape(y_pred, (-1, num_labels))
     if y_pred.shape[-1] != 1 and len(y_pred.shape)>1:
