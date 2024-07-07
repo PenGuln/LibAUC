@@ -40,6 +40,9 @@ class GCLoss_v1(nn.Module):
             tau_min (float, optional): lower bound of learnable temperature in iSogCLR (default: ``0.05``)
             tau_max (float, optional): upper bound of learnable temperature in iSogCLR (default: ``0.7``)
             beta (float, optional): the momentum parameter for updating temperature parameters in iSogCLR (default: ``0.9``)
+            gamma (float, optional): the moving average factor for dynamic loss in range the range of (0.0, 1.0) (default: ``0.9``)
+            gamma_schedule (str, optional): the schedule for gamma. Options are 'constant' (fixed ``gamma``) and 'cosine' (decaying from 1.0 to ``gamma``) (default: ``'cosine'``)
+            gamma_decay_epochs (int, optional): After this number of epochs, gamma will decrease to the value set by the option ``gamma``. Used only when gamma_schedule is 'cosine'. We recommend a value of total_training_epochs // 2 (default: ``-1``)
 
         Example:
             >>> loss_fn = GCLoss_v1(N=1000, tau=0.1)
@@ -65,7 +68,10 @@ class GCLoss_v1(nn.Module):
                  device=None, 
                  distributed=False,
                  enable_isogclr=False,
-                 tau_min=0.05, tau_max=0.7, rho=0.3, eta=0.01, beta=0.9):
+                 tau_min=0.05, tau_max=0.7, rho=0.3, eta=0.01, beta=0.9,
+                 gamma_schedule='constant',
+                 gamma_decay_epochs=-1,
+                 ):
         super(GCLoss_v1, self).__init__()
         if not device:
             self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -74,7 +80,8 @@ class GCLoss_v1(nn.Module):
         self.N = N
         self.u = torch.zeros(N).reshape(-1, 1) #.to(self.device) 
         self.tau = tau
-        self.gamma = gamma 
+        self.gamma_min = gamma 
+        self.gamma = 1.0
         self.distributed = distributed
         self.LARGE_NUM = 1e9
         self.eps = eps
@@ -88,6 +95,32 @@ class GCLoss_v1(nn.Module):
             self.beta = beta                                  # momentum parameter for the gradients of learnable tau
             self.learnable_tau = torch.ones(N).reshape(-1, 1) * self.tau
             self.grad_tau = torch.zeros(N).reshape(-1, 1)
+
+        self.gamma_schedule = gamma_schedule
+        assert self.gamma_schedule in ["constant", "cosine"]
+        if self.gamma_schedule == "cosine":
+            assert gamma_decay_epochs > 0
+            self.gamma_decay_epochs = gamma_decay_epochs
+        gamma_str = f"Using {self.gamma_schedule} schedule for gamma"
+        if self.gamma_schedule == "constant":
+            gamma_str += f" with gamma = {self.gamma_min}"
+        else:
+            gamma_str += f" with gamma_min = {self.gamma_min}, gamma_decay_epochs = {self.gamma_decay_epochs}"
+        print(gamma_str)
+
+    def adjust_gamma(self, epoch: int):
+        """Adjust gamma for dynamic loss according to its schedule."""
+        if self.gamma_schedule == "constant":
+            if epoch == 0:
+                self.gamma = 1.0
+            else:
+                self.gamma = self.gamma_min
+        elif self.gamma_schedule == "cosine":
+            if epoch < self.gamma_decay_epochs:
+                self.gamma = (1- self.gamma_min) * 0.5 * (1 + np.cos(np.pi * epoch / self.gamma_decay_epochs)) + self.gamma_min
+            else:
+                self.gamma = self.gamma_min
+        print(f"Epoch: {epoch}, gamma: {self.gamma:.3f}")
 
     def forward(self, 
                hidden1, 
@@ -133,13 +166,15 @@ class GCLoss_v1(nn.Module):
             neg_logits1 = torch.exp(logits_ab_aa/self.tau)*neg_mask   #(B, 2B)
             neg_logits2 = torch.exp(logits_ba_bb/self.tau)*neg_mask
 
-        # u init    
-        if self.u[index].sum() == 0:
-            u1 = torch.sum(neg_logits1, dim=1, keepdim=True)/(2*(batch_size-1))
-            u2 = torch.sum(neg_logits2, dim=1, keepdim=True)/(2*(batch_size-1))
+        if self.gamma_schedule == "constant" and self.gamma > self.gamma_min:
+            if self.u[index].sum() == 0:
+                gamma = 1.0
+            else:
+                gamma = self.gamma_min
         else:
-            u1 = (1 - self.gamma ) * self.u[index].cuda() + self.gamma * torch.sum(neg_logits1, dim=1, keepdim=True)/(2*(batch_size-1))
-            u2 = (1 - self.gamma ) * self.u[index].cuda() + self.gamma * torch.sum(neg_logits2, dim=1, keepdim=True)/(2*(batch_size-1))
+            gamma = self.gamma
+        u1 = (1 - gamma) * self.u[index].cuda() + gamma * torch.sum(neg_logits1, dim=1, keepdim=True)/(2*(batch_size-1))
+        u2 = (1 - gamma) * self.u[index].cuda() + gamma * torch.sum(neg_logits2, dim=1, keepdim=True)/(2*(batch_size-1))
 
         # this sync on all devices (since "hidden" are gathering from all devices)  #### maybe we can concat_all_gather index before?
         if self.distributed:
@@ -209,6 +244,8 @@ class GCLoss_v2(nn.Module):
             tau_min (float, optional): lower bound of learnable temperature in iSogCLR (default: ``0.005``)
             tau_max (float, optional): upper bound of learnable temperature in iSogCLR (default: ``0.05``)
             beta (float, optional): the momentum parameter for updating temperature parameters in iSogCLR (default: ``0.9``)
+            gamma_schedule (str, optional): the schedule for gamma. Options are 'constant' (fixed ``gamma``) and 'cosine' (decaying from 1.0 to ``gamma``) (default: ``'cosine'``)
+            gamma_decay_epochs (int, optional): After this number of epochs, gamma will decrease to the value set by the option ``gamma``. Used only when gamma_schedule is 'cosine'. We recommend a value of total_training_epochs // 2 (default: ``-1``)
 
 
         Example:
@@ -237,7 +274,10 @@ class GCLoss_v2(nn.Module):
             world_size=1,
             distributed=False,
             enable_isogclr=False,
-            tau_min=0.005, tau_max=0.05, rho=6.0, eta=0.01, beta=0.9):
+            tau_min=0.005, tau_max=0.05, rho=6.0, eta=0.01, beta=0.9,
+            gamma_schedule='constant',
+            gamma_decay_epochs=-1,
+            ):
         super(GCLoss_v2, self).__init__()
         self.cache_labels = cache_labels
         self.rank = rank
@@ -255,7 +295,8 @@ class GCLoss_v2(nn.Module):
         # sogclr        
         self.u1 = torch.zeros(N).reshape(-1, 1).detach()
         self.u2 = torch.zeros(N).reshape(-1, 1).detach()
-        self.gamma = gamma 
+        self.gamma_min = gamma 
+        self.gamma = 1.0
         self.tau = tau
 
         self.eps = 1e-20
@@ -271,6 +312,32 @@ class GCLoss_v2(nn.Module):
             self.learnable_tau_txt = torch.ones(N).reshape(-1, 1) * self.tau
             self.grad_tau_img = torch.zeros(N).reshape(-1, 1)
             self.grad_tau_txt = torch.zeros(N).reshape(-1, 1)
+
+        self.gamma_schedule = gamma_schedule
+        assert self.gamma_schedule in ["constant", "cosine"]
+        if self.gamma_schedule == "cosine":
+            assert gamma_decay_epochs > 0
+            self.gamma_decay_epochs = gamma_decay_epochs
+        gamma_str = f"Using {self.gamma_schedule} schedule for gamma"
+        if self.gamma_schedule == "constant":
+            gamma_str += f" with gamma = {self.gamma_min}"
+        else:
+            gamma_str += f" with gamma_min = {self.gamma_min}, gamma_decay_epochs = {self.gamma_decay_epochs}"
+        print(gamma_str)
+
+    def adjust_gamma(self, epoch: int):
+        """Adjust gamma for dynamic loss according to its schedule."""
+        if self.gamma_schedule == "constant":
+            if epoch == 0:
+                self.gamma = 1.0
+            else:
+                self.gamma = self.gamma_min
+        elif self.gamma_schedule == "cosine":
+            if epoch < self.gamma_decay_epochs:
+                self.gamma = (1- self.gamma_min) * 0.5 * (1 + np.cos(np.pi * epoch / self.gamma_decay_epochs)) + self.gamma_min
+            else:
+                self.gamma = self.gamma_min
+        print(f"Epoch: {epoch}, gamma: {self.gamma:.3f}")
 
     def forward(self, image_features, text_features, index):
         device = image_features.device
@@ -328,17 +395,23 @@ class GCLoss_v2(nn.Module):
         neg_logits_text  = torch.exp(logits_text_d_tau - self.b2[index].to(device))*neg_mask    #(B, 4B)
         
         # u init    
-        if self.u1[index].sum() == 0:
-            u1 = torch.sum(neg_logits_image, dim=1, keepdim=True)/(large_batch_size-1)
+        if self.gamma_schedule == "constant" and self.gamma > self.gamma_min:
+            if self.u1[index].sum() == 0:
+                gamma1 = 1.0
+            else:
+                gamma1 = self.gamma_min
+            if self.u2[index].sum() == 0:
+                gamma2 = 1.0
+            else:
+                gamma2 = self.gamma_min
         else:
-            u1 = (1 - self.gamma) * self.u1[index].to(device) * torch.exp(old_b1 - self.b1[index].to(device)) \
-                     + self.gamma * torch.sum(neg_logits_image, dim=1, keepdim=True)/(large_batch_size-1)
+            gamma1 = self.gamma
+            gamma2 = self.gamma
+        u1 = (1 - gamma1) * self.u1[index].to(device) * torch.exp(old_b1 - self.b1[index].to(device)) \
+                    + gamma1 * torch.sum(neg_logits_image, dim=1, keepdim=True)/(large_batch_size-1)
         
-        if self.u2[index].sum() == 0:
-            u2 = torch.sum(neg_logits_text, dim=1, keepdim=True)/(large_batch_size-1)
-        else:
-            u2 = (1 - self.gamma) * self.u2[index].to(device) * torch.exp(old_b2 - self.b2[index].to(device)) \
-                     + self.gamma * torch.sum(neg_logits_text, dim=1, keepdim=True)/(large_batch_size-1)
+        u2 = (1 - gamma2) * self.u2[index].to(device) * torch.exp(old_b2 - self.b2[index].to(device)) \
+                    + gamma2 * torch.sum(neg_logits_text, dim=1, keepdim=True)/(large_batch_size-1)
 
         u1 = u1.clamp(min=self.eps)
         u2 = u2.clamp(min=self.eps)
@@ -412,6 +485,9 @@ class GCLoss(torch.nn.Module):
     
     def forward(self, hidden1, hidden2, index,  **kwargs):
         return self.loss_fn(hidden1, hidden2, index, **kwargs)
+
+    def adjust_gamma(self, epoch: int):
+        self.loss_fn.adjust_gamma(epoch)
     
 
 # utils
