@@ -2,7 +2,7 @@ import setuptools
 
 with open("README.md", "r") as fh:
   long_description = fh.read()
-  
+
 setuptools.setup(
   name="libauc",
   version="1.3.1",
@@ -29,5 +29,6 @@ setuptools.setup(
                       'scikit-learn',
                       'opencv-python',
                       'torch_geometric',
-                      'ogb']
+                      'ogb',
+                      'webdataset']
 )
