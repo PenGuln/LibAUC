@@ -8,3 +8,4 @@ from .movielens import *
 from .dataset import *
 from .breastcancer import *
 from .musk2 import *
+from .webdataset import WebDataset
