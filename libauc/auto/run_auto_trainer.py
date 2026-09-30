@@ -21,7 +21,7 @@ import numpy as np
 import torch
 from omegaconf import OmegaConf
 
-from libauc.trainer import TrainingArguments, CLICallback, Trainer
+from libauc.trainer import TrainingArguments, CLICallback, Trainer, MILTrainer
 from libauc.trainer import load_dataset, parse_defaultconfig
 from libauc.trainer.helpers import build_megaconf, build_metric, set_seed
 from libauc.trainer.helpers import apply_cli_overrides as _apply_training_cli_overrides
@@ -66,6 +66,7 @@ _MEGACONF_DEFAULTS = {
         "project_name":           "libauc",
         "experiment_name":        "run_auto",
         "verbose":                1,
+        "instance_batch_size":    4,   # MIDAMLoss only: instances sampled per bag per step
     },
     "automax": {
         "deterministic":    True,
@@ -73,7 +74,7 @@ _MEGACONF_DEFAULTS = {
         "n_configs":        1,
         "SEED":             42,
         "name":             "automax_search",
-        "output_directory": "./automax_output",
+        "output_directory": None,  # falls back to automax.output_path, then ./automax_output
         "overwrite":        True,
         "n_workers":        1,     # trials evaluated concurrently
         "gpus_per_trial":   1,     # >1: each trial trains with DDP
@@ -279,16 +280,22 @@ def build_pipeline(
 
     extra_callbacks = callback_factory(automax_args) if callback_factory else []
 
-    # 8. Build autopartial Trainer
-    logger.info("Initialising Trainer (autopartial)...")
+    # 8. Build autopartial Trainer (MILTrainer for multiple instance learning)
+    trainer_kwargs = {}
+    trainer_cls = Trainer
+    if default_loss_config["type"] == "MIDAMLoss":
+        trainer_cls = MILTrainer
+        trainer_kwargs["instance_batch_size"] = training_cfg.get("instance_batch_size", 4)
+    logger.info(f"Initialising {trainer_cls.__name__} (autopartial)...")
     trainer = autopartial(
         partial(
-            Trainer,
+            trainer_cls,
             model_cfg     = model_cfg,
             train_dataset = train_dataset,
             eval_dataset  = eval_datasets if eval_datasets else None,
             metric        = metric_fn,
             callbacks     = [CLICallback(), *extra_callbacks],
+            **trainer_kwargs,
         ),
         train_args = train_args,
     )

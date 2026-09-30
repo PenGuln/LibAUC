@@ -31,6 +31,20 @@ python -m libauc.auto.run_auto_trainer --config_file examples/auto/recipes/confi
 
 For graph-classification datasets (OGB `ogbg-*`) with a GNN model, use `libauc.auto.run_auto_gnn` instead. It accepts the same config sections (`dataset`/`model`/`metrics`/`training`/`automax`) and CLI overrides, with a GNN `model` (e.g. `gcn`) in place of an image backbone.
 
+### Multiple instance learning (MIDAM)
+
+`MIDAMLoss` with the `MIDAM` optimizer optimizes AUROC when each sample is a *bag* of instances with one label (see `recipes/config_midam.yaml`):
+
+```bash
+python -m libauc.auto.run_auto_trainer --config_file examples/auto/recipes/config_midam.yaml
+```
+
+- With this loss, AutoMAX trains with `libauc.trainer.MILTrainer`. Each step samples `training.instance_batch_size` instances per bag and pools them stochastically; evaluation pools all instances of a bag.
+- `loss_kwargs.mode` sets the pooling: `attention` (default; tunes `margin`, `gamma`) or `softmax` (smoothed-max; also tunes `tau`). The optimizer's `lr`, `momentum` and `weight_decay` are tuned in both modes.
+- Models: `ffnn` for tabular bags. For image bags `(n_instances, C, H, W)`: `resnet20` (LibAUC's MIDAM models, as in the tutorials) or any backbone the image trainer supports: `resnet18`, `densenet121`, or a HuggingFace model ID, with the usual `pretrained` / `pretrained_remote` / `pretrained_path` options. For those, the classifier is replaced by an MIL head (attention hidden size `model.attention_dim`, default 128), `uint8` bags are scaled to [0, 1], and HuggingFace image processors are applied to the sampled instances. The variant matching the pooling mode is built automatically.
+- Larger backbones usually need a smaller `lr` than the tutorials' ResNet-20 (e.g. `resnet18` on BreastCancer learns at 5e-3 but not at 5e-2). The search range covers this. Lower `instance_batch_size` if large images run out of GPU memory.
+- Built-in datasets: `musk2` (tabular) and `breastcancer` (histopathology image bags). `val` is a stratified hold-out of the training bags (`dataset.kwargs.val_size`, default 0.2).
+
 ## Parallel and distributed search
 
 By default trials run one after another on one GPU. Two settings in the `automax` section (or on the command line) change that:

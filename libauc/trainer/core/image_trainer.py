@@ -289,22 +289,23 @@ class Trainer:
         """Epochs at which :meth:`_apply_lr_decay` decays the learning rate."""
         return self.args.decay_epochs
 
-    def _apply_lr_decay(self, epoch: int):
+    def _apply_lr_decay(self, epoch: int) -> bool:
         """Decay the LR by :attr:`decay_factor` if *epoch* is scheduled.
 
         The single place the decay schedule is applied (it used to live in
         ``CLICallback``, so a Trainer without that callback never decayed).
         Optimizers with an epoch-level regulariser (PESG's ``model_ref``)
-        also reset their reference model.
+        also reset their reference model. Returns ``True`` if it decayed.
         """
         if epoch not in self._decay_epochs():
-            return
+            return False
         if getattr(self.optimizer, "model_ref", None) is not None:
             self.optimizer.update_regularizer(decay_factor=self.decay_factor)
         else:
             self.optimizer.update_lr(decay_factor=self.decay_factor)
         if self.is_world_process_zero:
             logger.info(f"Epoch {epoch}: LR decayed by /{self.decay_factor}. New LR = {self.optimizer.param_groups[0]['lr']:.6f}")
+        return True
 
     def _set_dist_state(self):
         self.state.is_world_process_zero = self.is_world_process_zero
@@ -388,8 +389,7 @@ class Trainer:
 
         in_channels = 3  # sensible default (RGB)
         try:
-            first_sample = self.train_dataset[0]
-            img = first_sample[0] if isinstance(first_sample, (tuple, list)) else first_sample
+            img = self._example_input()
             if hasattr(img, "shape") and img.ndim >= 3:
                 in_channels = img.shape[0]
         except Exception:
@@ -494,6 +494,11 @@ class Trainer:
 
         self.model = model
 
+    def _example_input(self):
+        """One model input (e.g. a ``(C, H, W)`` image) used to infer ``in_channels``."""
+        first_sample = self.train_dataset[0]
+        return first_sample[0] if isinstance(first_sample, (tuple, list)) else first_sample
+
     @staticmethod
     def _get_optimizer(name: str):
         """Return the optimizer class *name* from ``libauc.optimizers``."""
@@ -523,7 +528,7 @@ class Trainer:
                 loss_fn = loss_cls(data_len=self.data_len, pos_len=self.pos_len, **train_args.loss_kwargs)
             else:
                 loss_fn = loss_cls(data_len=self.data_len, **train_args.loss_kwargs)
-        elif train_args.loss in ["mAPLoss", "APLoss", "pAUC_DRO_Loss", "tpAUC_KL_Loss"]:
+        elif train_args.loss in ["mAPLoss", "APLoss", "pAUC_DRO_Loss", "tpAUC_KL_Loss", "MIDAMLoss"]:
             loss_fn = loss_cls(data_len=self.data_len, **train_args.loss_kwargs)
         elif train_args.loss in ["pAUC_CVaR_Loss"]:
             loss_fn = loss_cls(data_len=self.data_len, pos_len=self.pos_len, **train_args.loss_kwargs)
@@ -621,25 +626,10 @@ class Trainer:
             model.train()
 
             # Training loop
-            for data, targets, index in self.trainloader:
+            for batch in self.trainloader:
                 self.callback_handler.on_step_begin(self.args, self.state)
 
-                data, targets = data.cuda(), targets.cuda()
-                y_pred = model(data)
-
-                # Compute loss
-                if self.args.loss == "CrossEntropyLoss":
-                    loss = self.loss_fn(y_pred, targets)
-                elif self.args.loss == "BCELoss":
-                    y_pred = torch.sigmoid(y_pred)
-                    loss = self.loss_fn(y_pred, targets)
-                else:
-                    y_pred = torch.sigmoid(y_pred)
-                    if isinstance(index, list):  # Multi-label
-                        index, task_id = index
-                        loss = self.loss_fn(y_pred, targets, index=index.cuda(), task_id=task_id)
-                    else:
-                        loss = self.loss_fn(y_pred, targets, index=index.cuda())
+                loss = self._compute_loss(model, batch)
 
                 # Optimizer step
                 self.optimizer.zero_grad()
@@ -671,6 +661,22 @@ class Trainer:
         self.callback_handler.on_train_end(self.args, self.state)
 
         return self.state.train_log
+
+    def _compute_loss(self, model, batch):
+        """Forward one training batch and return the loss (override for other data layouts)."""
+        data, targets, index = batch
+        data, targets = data.cuda(), targets.cuda()
+        y_pred = model(data)
+
+        if self.args.loss == "CrossEntropyLoss":
+            return self.loss_fn(y_pred, targets)
+        y_pred = torch.sigmoid(y_pred)
+        if self.args.loss == "BCELoss":
+            return self.loss_fn(y_pred, targets)
+        if isinstance(index, list):  # Multi-label
+            index, task_id = index
+            return self.loss_fn(y_pred, targets, index=index.cuda(), task_id=task_id)
+        return self.loss_fn(y_pred, targets, index=index.cuda())
 
     def evaluate(self, loader, model):
         """

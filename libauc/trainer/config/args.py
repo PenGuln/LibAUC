@@ -161,13 +161,18 @@ def parse_defaultconfig(type_name: str, multilabel: bool = False, kwargs: dict =
     +-----------------------------+------------------------------+
     | ``BCELoss``                 | ``BCELossSpace``             |
     +-----------------------------+------------------------------+
+    | ``MIDAMLoss`` / ``MIDAM``   | ``MIDAMAttentionLossSpace``  |
+    |                             | (``MIDAMSoftmaxLossSpace``   |
+    |                             | when mode ``softmax``)       |
+    +-----------------------------+------------------------------+
 
     Args:
         type_name (str): Name of the loss or optimizer class.
         multilabel (bool): When ``True``, selects the multi-label variant of
             the space if one exists (default: ``False``).
         kwargs (dict): Additional keyword arguments for the loss/optimizer,
-            used to disambiguate ``pAUCLoss`` by its ``mode`` key.
+            used to disambiguate ``pAUCLoss`` and ``MIDAMLoss`` by their
+            ``mode`` key.
 
     Returns:
         dict: ``{"optimizer": <optimizer_cfg>, "loss": <loss_cfg>}`` where
@@ -228,6 +233,11 @@ def parse_defaultconfig(type_name: str, multilabel: bool = False, kwargs: dict =
         from .spaces import AdamSpace as Sp
     elif type_name in ('BCELoss',):
         from .spaces import BCELossSpace as Sp
+    elif type_name in ('MIDAMLoss', 'MIDAM'):
+        if kwargs.get('mode', 'attention') == 'softmax':
+            from .spaces import MIDAMSoftmaxLossSpace as Sp
+        else:
+            from .spaces import MIDAMAttentionLossSpace as Sp
     else:
         raise ValueError(f"Unsupported loss/optimizer type: '{type_name}'")
 

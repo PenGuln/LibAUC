@@ -565,3 +565,69 @@ class BCELossSpace:
         "space" : {}
     }
     optimizer = {}
+
+
+# Multiple instance learning (MIDAM). ``mode`` selects the pooling and, with
+# it, the model MILTrainer builds; tips for the ranges are from the
+# MIDAMLoss docstring.
+_MIDAM_OPTIMIZER = {
+    "type" : "MIDAM",
+    "space" : {
+        "lr" : {
+            "val": (0.001, 0.1),
+            "default" : 0.01,
+            "log": True
+        },
+        "momentum" : {
+            "val" : (0.0, 0.9),
+            "default" : 0.1
+        },
+        "weight_decay" : {
+            "val" : (0.0, 0.001),
+            "default" : 0.0001
+        }
+    }
+}
+
+class MIDAMAttentionLossSpace:
+    optimizer = _MIDAM_OPTIMIZER
+    loss = {
+        "type" : "MIDAMLoss",
+        "space" : {
+            "mode" : {
+                "val" : "attention"
+            },
+            "margin" : {
+                "val" : [0.1, 0.3, 0.5, 0.7, 0.9, 1.0],
+                "default" : 1.0
+            },
+            "gamma" : {
+                "val" : [0.1, 0.3, 0.5, 0.7, 0.9],
+                "default" : 0.9
+            }
+        }
+    }
+
+class MIDAMSoftmaxLossSpace:
+    optimizer = _MIDAM_OPTIMIZER
+    loss = {
+        "type" : "MIDAMLoss",
+        "space" : {
+            "mode" : {
+                "val" : "softmax"
+            },
+            "margin" : {
+                "val" : [0.1, 0.3, 0.5, 0.7, 0.9, 1.0],
+                "default" : 1.0
+            },
+            "gamma" : {
+                "val" : [0.1, 0.3, 0.5, 0.7, 0.9],
+                "default" : 0.9
+            },
+            "tau" : {
+                "val" : (0.1, 10.0),
+                "default" : 0.1,
+                "log" : True
+            }
+        }
+    }

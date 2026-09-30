@@ -251,6 +251,37 @@ def _load_ogbg(name: str, class_id: int, root_path: str, splits: list):
 # Dataset loading
 # ---------------------------------------------------------------------------
 
+def _load_mil(name: str, root_path: str, splits: list, val_size: float = 0.2):
+    """MIL bag datasets; ``val`` is a stratified hold-out of the training bags."""
+    from sklearn.model_selection import train_test_split
+    from libauc.datasets import BreastCancer, CustomDataset, MUSK2
+
+    if name == "musk2":
+        (train_x, train_y), (test_x, test_y) = MUSK2(root=root_path)
+    else:
+        (train_x, train_y), (test_x, test_y) = BreastCancer(root=root_path, MIL_flag=True)
+
+    def bags(x, y):
+        return CustomDataset(x, y, return_index=True)
+
+    train_idx = np.arange(len(train_x))
+    val_idx = None
+    if "val" in splits:
+        train_idx, val_idx = train_test_split(
+            train_idx, test_size=val_size, stratify=np.asarray(train_y).reshape(-1), random_state=42,
+        )
+
+    eval_datasets = []
+    for split in splits:
+        if split == "val":
+            eval_datasets.append(bags(train_x[val_idx], train_y[val_idx]))
+        elif split == "test":
+            eval_datasets.append(bags(test_x, test_y))
+        else:
+            raise NotImplementedError(f"Split '{split}' is not implemented for dataset '{name}'.")
+    return bags(train_x[train_idx], train_y[train_idx]), eval_datasets
+
+
 def load_dataset(name: str, splits: list, **kwargs):
     """
     Load a dataset by name and return train + eval splits.
@@ -553,6 +584,11 @@ def load_dataset(name: str, splits: list, **kwargs):
                     f"Split '{split}' is not implemented for dataset '{name}'."
                 )
         return train_dataset, eval_datasets
+
+    elif name in ("musk2", "breastcancer"):
+        # Multiple instance learning bag datasets (use with MIDAMLoss / MILTrainer).
+        # Downloaded automatically to <root_path>/MUSK2 or <root_path>/BreastCancer.
+        return _load_mil(name, root_path, splits, val_size=kwargs.get("val_size", 0.2))
 
     else:
         raise ValueError(

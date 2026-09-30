@@ -1,0 +1,44 @@
+# Multiple instance learning: MIDAMLoss + MIDAM on MUSK2 (tabular bags).
+# For image bags use `dataset.name: breastcancer`, `model.name: resnet20`
+# and a larger `instance_batch_size` (e.g. 128).
+dataset:
+  name: musk2
+  eval_splits: [val, test]
+  kwargs:
+    val_size: 0.2        # stratified hold-out of the training bags
+
+model:
+  name: ffnn             # ffnn (tabular bags) | resnet20 (image bags)
+
+metrics:
+  - AUROC
+
+training:
+  project_name: libauc
+  experiment_name: ffnn_MIDAMLoss_musk2
+  SEED: 2026
+
+  epochs: 100
+  batch_size: 16         # bags per step
+  instance_batch_size: 4 # instances sampled per bag per step
+  eval_batch_size: 16
+  sampling_rate: 0.5
+  num_workers: 0
+  decay_epochs: [0.5, 0.75]
+
+  loss: MIDAMLoss
+  loss_kwargs:
+    mode: attention      # attention | softmax (softmax also tunes tau)
+  optimizer: MIDAM
+
+  output_path: ./output
+  resume_from_checkpoint: false
+  save_checkpoint_every: 10
+
+automax:
+  deterministic: true
+  n_trials: 20
+  SEED: 42
+  name: ffnn_MIDAMLoss_musk2
+  output_path: ./automax_output
+  overwrite: true

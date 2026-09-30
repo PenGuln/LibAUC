@@ -73,7 +73,7 @@ _MEGACONF_DEFAULTS = {
         "n_configs":        1,
         "SEED":             42,
         "name":             "automax_gnn_search",
-        "output_directory": "./automax_output",
+        "output_directory": None,  # falls back to automax.output_path, then ./automax_output
         "overwrite":        True,
         "n_workers":        1,     # trials evaluated concurrently
         "gpus_per_trial":   1,     # >1: each trial trains with DDP
