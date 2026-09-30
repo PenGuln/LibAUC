@@ -1,0 +1,44 @@
+dataset:
+  name: cifar10
+  eval_splits: [val, test]
+  kwargs:
+    imratio: 0.02
+
+model:
+  name: resnet18
+  pretrained: false
+
+metrics:
+  - AUROC
+metric_kwargs:
+  - max_fpr: 0.3
+    min_tpr: 0.7
+
+training:
+  project_name: libauc
+  experiment_name: resnet18_tpauc_cifar10
+  SEED: 2026
+
+  epochs: 60
+  batch_size: 128
+  eval_batch_size: 256
+  sampling_rate: 0.5
+  num_workers: 0
+  decay_epochs: [0.5, 0.75]
+  
+  loss: pAUCLoss
+  loss_kwargs:
+    mode: 2w
+  optimizer: SOTAs
+  
+  output_path: ./output
+  resume_from_checkpoint: false
+  save_checkpoint_every: 5
+
+automax:
+  deterministic: true
+  n_trials: 5
+  SEED: 42
+  name: resnet18_tpauc_cifar10
+  output_path: ./automax_output
+  overwrite: true

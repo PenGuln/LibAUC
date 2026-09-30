@@ -100,6 +100,18 @@ Usage
 >>> optimizer.update_regularizer()
 ```
 
+AutoMAX: Hyperparameter Search
+---
+`libauc.auto` (formerly the standalone [AutoMAX](https://github.com/Optimization-AI/AutoMAX) library) tunes the hyperparameters of any supported loss/optimizer pair with Bayesian optimization ([SMAC3](https://github.com/automl/SMAC3)). It can evaluate several configurations at once and train each one on several GPUs with DDP.
+
+```
+$ pip install "libauc[auto]"
+$ python -m libauc.auto.run_auto_trainer --config_file examples/auto/recipes/config_auc.yaml \
+      --n_workers 4 --gpus_per_trial 2      # 4 trials at a time, each on 2 GPUs
+```
+
+See [examples/auto](https://github.com/Optimization-AI/LibAUC/tree/main/examples/auto) for recipes, the Python API and the GUI.
+
 Tutorials
 -------
 ### X-Risk Minimization

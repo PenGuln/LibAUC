@@ -1,20 +1,32 @@
 import logging
 import torch
 import numpy as np
-from libauc.sampler import DualSampler, TriSampler
+from libauc.sampler import DualSampler, TriSampler, DistributedDualSampler, DistributedTriSampler
 import os
 from typing import Callable, List, Optional, Mapping
 from torch.utils.data import Dataset
 import importlib
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+from libauc.utils import is_distributed
 
 from ..config.args import TrainingArguments
+from ..helpers import set_seed
 from .callbacks import CallbackHandler, TrainerCallback, TrainerState
+from .distributed import ShardSampler, all_reduce_mean, gather_shards
 
 logger = logging.getLogger(__name__)
 
 # Keys that identify classification-head parameters in both built-in libauc
 # models (fc / linear) and HuggingFace models (classifier / head).
 _HEAD_PARTS: frozenset = frozenset({"fc", "linear", "classifier", "head"})
+
+# Losses that need no cross-rank synchronisation beyond DDP's gradient
+# averaging (AUCMLoss's a/b are all-reduced by PESG).
+_DDP_NATIVE_LOSSES: frozenset = frozenset({"AUCMLoss", "BCELoss", "CrossEntropyLoss"})
+# Optimizers that update loss parameters without all-reducing them.
+_DDP_UNSYNCED_OPTIMIZERS: frozenset = frozenset({"PDSCA"})
 
 class _ChannelExpand:
     """DataLoader collate that expands single-channel images to 3 channels.
@@ -114,6 +126,17 @@ class Trainer:
     helpers so subclasses like :class:`~trainer.core.graph_trainer.GraphTrainer`
     can override only the parts they need.
 
+    Distributed training: when a ``torch.distributed`` process group with
+    more than one rank is initialised before construction (e.g. under
+    ``torchrun``, see :func:`~libauc.trainer.init_distributed`), the model is
+    wrapped in ``DistributedDataParallel``, training uses
+    :class:`~libauc.sampler.DistributedDualSampler` /
+    :class:`~libauc.sampler.DistributedTriSampler` with
+    ``train_args.batch_size`` as the **per-GPU** batch size, evaluation is
+    sharded across ranks and gathered, and only rank 0 logs and writes
+    checkpoints. Callbacks run on every rank; use
+    ``state.is_world_process_zero`` to restrict side effects to rank 0.
+
     Args:
         train_args (TrainingArguments): Fully populated training configuration
             produced by :class:`~trainer.config.args.TrainingArguments`.
@@ -196,11 +219,19 @@ class Trainer:
         """
         
         self.args = train_args
+        self.distributed = bool(is_distributed())
+        self.rank        = dist.get_rank() if self.distributed else 0
+        self.world_size  = dist.get_world_size() if self.distributed else 1
+        # Seed before building the model so every trial / every DDP rank
+        # starts from the same, reproducible initialisation.
+        set_seed(self.args.SEED)
+
         self.train_dataset = train_dataset   # set before _build_model so it
         self._build_model(model_cfg)         # can infer in_channels from data
         self.eval_dataset = eval_dataset
         self.state = TrainerState()
         self.state.total_epoch = self.args.epochs
+        self._set_dist_state()
         
         # Setup data loaders
         self.sampler, self.trainloader = self._get_train_dataloader(self.args)
@@ -220,7 +251,11 @@ class Trainer:
 
         # Setup optimizer and loss
         self.loss_fn, self.optimizer = self._construct_optimizer_and_loss(self.model, train_args)
-        
+
+        if self.distributed:
+            self._check_ddp_support()
+            self.model = DDP(self.model, device_ids=[torch.cuda.current_device()])
+
         # Setup metric and callbacks
         self.metric = metric
         if callbacks is None:
@@ -232,6 +267,79 @@ class Trainer:
     def add_callback(self, callback):
         """Add a callback to the trainer."""
         self.callback_handler.add_callback(callback)
+
+    # ------------------------------------------------------------------
+    # Distributed helpers
+    # ------------------------------------------------------------------
+
+    @property
+    def is_world_process_zero(self) -> bool:
+        """``True`` on the process that logs and writes checkpoints."""
+        return self.rank == 0
+
+    @property
+    def unwrapped_model(self) -> torch.nn.Module:
+        """The underlying model, without the ``DistributedDataParallel`` wrapper."""
+        return self.model.module if isinstance(self.model, DDP) else self.model
+
+    # LR divisor applied at each epoch in ``args.decay_epochs``.
+    decay_factor: float = 10.0
+
+    def _decay_epochs(self) -> List[int]:
+        """Epochs at which :meth:`_apply_lr_decay` decays the learning rate."""
+        return self.args.decay_epochs
+
+    def _apply_lr_decay(self, epoch: int):
+        """Decay the LR by :attr:`decay_factor` if *epoch* is scheduled.
+
+        The single place the decay schedule is applied (it used to live in
+        ``CLICallback``, so a Trainer without that callback never decayed).
+        Optimizers with an epoch-level regulariser (PESG's ``model_ref``)
+        also reset their reference model.
+        """
+        if epoch not in self._decay_epochs():
+            return
+        if getattr(self.optimizer, "model_ref", None) is not None:
+            self.optimizer.update_regularizer(decay_factor=self.decay_factor)
+        else:
+            self.optimizer.update_lr(decay_factor=self.decay_factor)
+        if self.is_world_process_zero:
+            logger.info(f"Epoch {epoch}: LR decayed by /{self.decay_factor}. New LR = {self.optimizer.param_groups[0]['lr']:.6f}")
+
+    def _set_dist_state(self):
+        self.state.is_world_process_zero = self.is_world_process_zero
+        self.state.world_size = self.world_size
+
+    def _sync_buffers(self):
+        """Copy rank 0's buffers (e.g. BatchNorm running stats) to every rank.
+
+        DDP broadcasts buffers only at the start of a training forward, so
+        after the last step each rank holds stats updated on its own shard.
+        Syncing before evaluation makes every shard use the weights that rank
+        0 checkpoints.
+        """
+        for buf in self.unwrapped_model.buffers():
+            dist.broadcast(buf, src=0)
+
+    def _check_ddp_support(self):
+        """Warn when the loss/optimizer pair has no distributed implementation.
+
+        DDP averages model gradients, but losses with auxiliary state (e.g.
+        ``a``/``b``/``alpha`` or per-sample moving averages) must be
+        synchronised by the loss/optimizer itself; see LibAUC's
+        ``examples/20_Distributed_Training_*`` for the supported pairs.
+        """
+        loss_ok = (
+            getattr(self.loss_fn, "distributed", False)
+            or getattr(getattr(self.loss_fn, "loss_fn", None), "distributed", False)  # pAUCLoss wrapper
+            or self.args.loss in _DDP_NATIVE_LOSSES
+        )
+        if not loss_ok or self.args.optimizer in _DDP_UNSYNCED_OPTIMIZERS:
+            logger.warning(
+                f"{self.args.loss} / {self.args.optimizer} has no distributed-aware "
+                "implementation in libauc; auxiliary loss/optimizer state will not be "
+                "synchronised across GPUs and results may differ from single-GPU training."
+            )
     
     def _build_model(self, model_cfg: dict):
         """
@@ -449,8 +557,17 @@ class Trainer:
         return None
 
     def _get_train_dataloader(self, train_args: TrainingArguments):
-        """Create training data loader with dual sampling."""
-        if train_args.num_tasks >= 3:
+        """Create training data loader with dual sampling.
+
+        In distributed mode ``batch_size`` is per GPU and each rank draws a
+        disjoint slice of every global mini-batch.
+        """
+        if self.distributed:
+            if train_args.num_tasks >= 3:
+                sampler = DistributedTriSampler(self.train_dataset, train_args.batch_size, sampling_rate=train_args.sampling_rate)
+            else:
+                sampler = DistributedDualSampler(self.train_dataset, train_args.batch_size, sampling_rate=train_args.sampling_rate)
+        elif train_args.num_tasks >= 3:
             sampler = TriSampler(self.train_dataset, train_args.batch_size, sampling_rate=train_args.sampling_rate)
         else:
             sampler = DualSampler(self.train_dataset, train_args.batch_size, sampling_rate=train_args.sampling_rate)
@@ -469,6 +586,7 @@ class Trainer:
             dataset,
             batch_size=train_args.eval_batch_size,
             shuffle=False,
+            sampler=ShardSampler(dataset, self.rank, self.world_size) if self.distributed else None,
             num_workers=train_args.num_workers,
             collate_fn=self._make_collate_fn(),
         )
@@ -495,7 +613,10 @@ class Trainer:
                 logger.info("No checkpoint found in output folder, starting from scratch")
         
         for epoch in range(self.state.epoch, self.args.epochs):
+            if hasattr(self.sampler, "set_epoch"):
+                self.sampler.set_epoch(epoch)
             self.callback_handler.on_epoch_begin(self.args, self.state)
+            self._apply_lr_decay(epoch)
             step_losses = []
             model.train()
 
@@ -530,7 +651,7 @@ class Trainer:
 
             # Evaluation
             model.eval()
-            avg_train_loss = float(np.mean(step_losses))
+            avg_train_loss = all_reduce_mean(float(np.mean(step_losses)))
             metrics, test_true, test_pred = self.evaluate_loop(model)
 
             self.callback_handler.on_epoch_end(
@@ -565,16 +686,19 @@ class Trainer:
         test_pred_list = []
         test_true_list = []
         
-        for test_data, test_targets, _ in loader:
-            test_data = test_data.cuda()
-            test_pred = model(test_data)
-            # Apply sigmoid to convert logits to probabilities
-            test_pred = torch.sigmoid(test_pred)
-            test_pred_list.append(test_pred.cpu().detach().numpy())
-            test_true_list.append(test_targets.numpy())
+        with torch.no_grad():
+            for test_data, test_targets, _ in loader:
+                test_data = test_data.cuda()
+                test_pred = model(test_data)
+                # Apply sigmoid to convert logits to probabilities
+                test_pred = torch.sigmoid(test_pred)
+                test_pred_list.append(test_pred.cpu().detach().numpy())
+                test_true_list.append(test_targets.numpy())
             
         test_true = np.concatenate(test_true_list)
         test_pred = np.concatenate(test_pred_list)
+        if self.distributed:
+            test_true, test_pred = gather_shards(test_true, test_pred)
         # Flatten if needed (for binary classification)
         if test_pred.ndim > 1:
             test_pred = test_pred.flatten()
@@ -597,6 +721,9 @@ class Trainer:
         metrics = []
         test_true = None
         test_pred = None
+
+        if self.distributed:
+            self._sync_buffers()
         
         if not self.evalloaders:
             self.callback_handler.on_evaluate(self.args, self.state)
@@ -615,11 +742,15 @@ class Trainer:
         return metrics, test_true, test_pred
 
     def save_checkpoint(self, checkpoint_path: str):
+        # Every rank holds identical weights; only rank 0 writes.
+        if not self.is_world_process_zero:
+            return
         # Ensure checkpoint directory exists
         os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
         
         checkpoint = {
-            'model_state_dict': self.model.state_dict(),
+            # Unwrapped so checkpoints load with or without DDP.
+            'model_state_dict': self.unwrapped_model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'loss_fn_state_dict': self.loss_fn.state_dict(),
             'loss_fn': self.loss_fn,
@@ -636,9 +767,10 @@ class Trainer:
             raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
         
         logger.info(f"Loading checkpoint from {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, weights_only=False)
+        map_location = f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu"
+        checkpoint = torch.load(checkpoint_path, weights_only=False, map_location=map_location)
                 
-        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.unwrapped_model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         if hasattr(self.loss_fn, 'a') and hasattr(self.loss_fn, 'b') and hasattr(self.loss_fn, 'alpha'):
             self.loss_fn.load_state_dict(checkpoint['loss_fn_state_dict'])
@@ -646,6 +778,7 @@ class Trainer:
             self.loss_fn = checkpoint['loss_fn']
         
         self.state = checkpoint['state']
+        self._set_dist_state()
         # have to check if the args are the same as the current args
         self.args = checkpoint['args']
                 

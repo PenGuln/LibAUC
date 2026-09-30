@@ -5,6 +5,10 @@ Usage::
 
     python -m libauc.trainer.run_image_trainer --config_file config.yaml
 
+Multi-GPU (DistributedDataParallel; ``batch_size`` is per GPU)::
+
+    torchrun --nproc_per_node 4 -m libauc.trainer.run_image_trainer --config_file config.yaml
+
 CLI flags mirror ``TrainingArguments`` fields and override the YAML config
 when supplied.
 """
@@ -17,7 +21,7 @@ import numpy as np
 from omegaconf import OmegaConf
 
 from .config import TrainingArguments, parse_defaultconfig
-from .core import CLICallback, Trainer
+from .core import CLICallback, Trainer, init_distributed, cleanup_distributed
 from .data import load_dataset
 from .helpers import build_megaconf, apply_cli_overrides, build_metric, set_seed
 
@@ -107,6 +111,7 @@ def main():
     )
 
     args = parse_args()
+    init_distributed()  # no-op unless launched with torchrun
 
     # 1. Load config (megaconf) and apply CLI overrides
     logger.info(f"Loading config from: {args.config_file}")
@@ -196,6 +201,7 @@ def main():
     logger.info("Starting training...")
     trainer.train()
     logger.info("Training complete.")
+    cleanup_distributed()
 
 
 if __name__ == "__main__":

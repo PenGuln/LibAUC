@@ -1,0 +1,43 @@
+dataset:
+  name: cifar10       
+  eval_splits: [val, test]
+  kwargs:
+    imratio: 0.1
+
+model:
+  name: resnet18
+  pretrained: false
+
+metrics:
+  - AUROC
+
+training:
+  project_name: libauc
+  experiment_name: resnet18_AUCMLoss_cifar10
+  SEED: 2026
+
+  epochs: 100
+  batch_size: 128
+  eval_batch_size: 256
+  sampling_rate: 0.2
+  num_workers: 0
+  decay_epochs: [0.5, 0.75]
+
+  loss: AUCMLoss
+  optimizer: PESG
+
+  output_path: ./output
+  resume_from_checkpoint: false
+  save_checkpoint_every: 5
+
+automax:
+  deterministic: true
+  n_trials: 5
+  SEED: 42
+  name: resnet18_AUCMLoss_cifar10
+  output_path: ./automax_output
+  overwrite: true
+  # Parallel / distributed search (see examples/auto/README.md):
+  # n_workers: 4          # trials evaluated at the same time
+  # gpus_per_trial: 2     # >1: each trial trains with DDP; batch_size is per GPU
+  # devices: [0, 1, 2, 3, 4, 5, 6, 7]

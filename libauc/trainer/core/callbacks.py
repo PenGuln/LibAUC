@@ -16,6 +16,15 @@ class TrainerState:
         self.step = 0
         self.train_log = []
         self.train_summary = {}
+        # Distributed training: callbacks run on every rank, so side effects
+        # (printing, logging, writing files) should be gated on this flag.
+        self.is_world_process_zero = True
+        self.world_size = 1
+
+
+def _is_main(state) -> bool:
+    # getattr: states pickled into checkpoints by older versions lack the flag.
+    return getattr(state, "is_world_process_zero", True)
 
 
 class TrainerCallback:
@@ -341,6 +350,10 @@ class CLICallback(TrainerCallback):
         two ``====`` separator lines so the user can confirm all hyperparameters
         before training starts.
         """
+        if not _is_main(state):
+            self._use_wandb = False
+            return
+
         try:
             import wandb
             config = {
@@ -362,19 +375,6 @@ class CLICallback(TrainerCallback):
         print("=" * 60)
         pprint.pprint(config, indent=2, sort_dicts=False)
         print("=" * 60)
-
-    def on_epoch_begin(self, args: TrainingArguments, state: TrainerState, **kwargs):
-        """Apply learning-rate / regulariser decay if the epoch is scheduled.
-
-        Checks whether ``state.epoch`` is listed in ``args.decay_epochs``.
-        If so, decays by a fixed factor of 10:
-        """
-        optimizer = kwargs.get("optimizer")
-        if optimizer and state.epoch in args.decay_epochs:
-            if getattr(optimizer, "model_ref", None) is not None:
-                optimizer.update_regularizer(decay_factor=10)
-            else:
-                optimizer.update_lr(decay_factor=10)
 
     def on_epoch_end(self, args: TrainingArguments, state: TrainerState, **kwargs):
         """Record metrics, update the console display, and log to W&B.
@@ -409,7 +409,9 @@ class CLICallback(TrainerCallback):
         log = _build_log_dict(metrics, train_loss, lr, epoch=state.epoch + 1)
 
         # ---- Console output (mode-dependent) ----------------------------
-        if args.verbose == 1:
+        if not _is_main(state):
+            pass
+        elif args.verbose == 1:
             # Overwrite the same line with an updated progress bar
             bar_str = self._render_bar(state.epoch + 1, state.total_epoch, log)
             sys.stdout.write(bar_str)
@@ -453,7 +455,8 @@ class CLICallback(TrainerCallback):
 
         4. Stores the summary dict under ``state.train_summary``.
         """
-        if args.verbose != 0:
+        is_main = _is_main(state)
+        if args.verbose != 0 and is_main:
             print("-" * 50)
             print("Training complete.")
 
@@ -480,14 +483,16 @@ class CLICallback(TrainerCallback):
 
         if num_evals == 1:
             val = train_log[best_idx]['metrics'][0][target]
-            logger.info(f"best validation {target}: {val}")
+            if is_main:
+                logger.info(f"best validation {target}: {val}")
             train_summary["val"] = val
         else:
             val   = train_log[best_idx]['metrics'][0][target]
             score = sum(
                 train_log[best_idx]['metrics'][x][target] for x in range(1, num_evals)
             ) / (num_evals - 1)
-            logger.info(f"best validation {target}: {val}, best test avg. {target}: {score}")
+            if is_main:
+                logger.info(f"best validation {target}: {val}, best test avg. {target}: {score}")
             train_summary["val"]  = val
             train_summary["test"] = score
 

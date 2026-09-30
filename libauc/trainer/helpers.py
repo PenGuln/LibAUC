@@ -51,12 +51,26 @@ def build_metric(metric_names, metric_kwargs):
             ``test_pred`` is the 1-D array of model output scores, and
             ``results`` maps each metric name to its score.
     """
-    from sklearn import metrics as skmetrics
+    return MetricFn(metric_names, metric_kwargs)
 
-    def metric_fn(test_true, test_pred):
+
+class MetricFn:
+    """Callable returned by :func:`build_metric`.
+
+    A class rather than a closure so it can be pickled into the worker
+    processes AutoMAX spawns for parallel / distributed trials.
+    """
+
+    def __init__(self, metric_names, metric_kwargs):
+        self.metric_names  = list(metric_names)
+        self.metric_kwargs = list(metric_kwargs)
+
+    def __call__(self, test_true, test_pred):
+        from sklearn import metrics as skmetrics
+
         results = {}
-        for idx, name in enumerate(metric_names):
-            kwargs = metric_kwargs[idx] if idx < len(metric_kwargs) else {}
+        for idx, name in enumerate(self.metric_names):
+            kwargs = self.metric_kwargs[idx] if idx < len(self.metric_kwargs) else {}
             name_upper = name.upper()
             if name_upper == "AUROC":
                 if "max_fpr" in kwargs or "min_tpr" in kwargs:
@@ -74,8 +88,6 @@ def build_metric(metric_names, metric_kwargs):
                 logger.warning(f"Unknown metric '{name}', skipping.")
         return results
 
-    return metric_fn
-
 
 # ---------------------------------------------------------------------------
 # Reproducibility
@@ -85,7 +97,7 @@ def set_seed(seed: int) -> None:
     """Set global random seed for NumPy, PyTorch, and cuDNN."""
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark     = False
     logger.info(f"Global seed set to {seed}")

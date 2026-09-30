@@ -9,6 +9,7 @@ from torch.utils.data import Dataset
 from .image_trainer import Trainer
 from ..config.args import TrainingArguments
 from .callbacks import CallbackHandler, TrainerCallback
+from .distributed import ShardSampler, all_reduce_mean, gather_shards
 
 logger = logging.getLogger(__name__)
 
@@ -42,8 +43,8 @@ class GraphTrainer(Trainer):
       positive/negative balancing.
     * :meth:`_forward` — dispatches to the correct GNN forward signature
       (with or without ``edge_attr``).
-    * :meth:`train` — adds optional learning-rate decay at specified epochs
-      via ``optimizer.update_lr``.
+    * :meth:`_decay_epochs` — decays the learning rate by ``decay_factor`` at
+      ``decay_epochs`` (defaults to ``train_args.decay_epochs``).
 
     Supported GNN architectures
     ---------------------------
@@ -65,9 +66,11 @@ class GraphTrainer(Trainer):
             evaluation splits (default: ``None``).
         metric (callable, optional): ``(y_true, y_pred) -> dict[str, float]``
         callbacks (list[TrainerCallback], optional): Training callbacks.
-        decay_epochs (list[int], optional): Epoch indices at which
-            ``optimizer.update_lr(decay_factor=decay_factor)`` is called
-            (default: no decay).
+        decay_epochs (list, optional): Epochs at which the learning rate is
+            divided by ``decay_factor``; floats are fractions of
+            ``train_args.epochs``. Defaults to ``train_args.decay_epochs``.
+            This is the only decay schedule applied (the two are not
+            combined).
         decay_factor (float): LR divisor at each decay epoch (default: ``10.0``).
         train_eval_dataset: Optional dataset for an unbiased train-split
             evaluation; falls back to ``train_dataset`` when ``None``.
@@ -108,7 +111,8 @@ class GraphTrainer(Trainer):
         eval_dataset        : list of PyG-compatible graph datasets (eval splits)
         metric              : callable (y_true, y_pred) -> dict of floats
         callbacks           : list of TrainerCallback instances
-        decay_epochs        : epoch indices at which to decay the LR, e.g. [100, 200]
+        decay_epochs        : epochs at which to decay the LR, e.g. [100, 200];
+                              defaults to train_args.decay_epochs
         decay_factor        : LR divisor applied at each decay epoch (default 10)
         train_eval_dataset  : optional separate dataset for unbiased train-split
                               evaluation; falls back to train_dataset when None
@@ -117,7 +121,9 @@ class GraphTrainer(Trainer):
         # parent calls _get_train_dataloader() which we override below.
         self._model_cfg_gnn      = model_cfg
         self._with_edge_features = False
-        self.decay_epochs        = decay_epochs or []
+        self.decay_epochs        = None if decay_epochs is None else [
+            int(e * train_args.epochs) if isinstance(e, float) else e for e in decay_epochs
+        ]
         self.decay_factor        = decay_factor
         self.train_eval_dataset  = train_eval_dataset
 
@@ -234,15 +240,19 @@ class GraphTrainer(Trainer):
         self._with_edge_features  = with_edge_features
         self.model = model
 
+    def _decay_epochs(self) -> List[int]:
+        return self.args.decay_epochs if self.decay_epochs is None else self.decay_epochs
+
     # ------------------------------------------------------------------
     # DataLoader overrides – use PyG's DataLoader
     # ------------------------------------------------------------------
 
     def _get_train_dataloader(self, train_args: TrainingArguments):
         from torch_geometric.loader import DataLoader as PyGDataLoader
-        from libauc.sampler import DualSampler
+        from libauc.sampler import DualSampler, DistributedDualSampler
 
-        sampler = DualSampler(
+        sampler_cls = DistributedDualSampler if self.distributed else DualSampler
+        sampler = sampler_cls(
             self.train_dataset,
             train_args.batch_size,
             sampling_rate=train_args.sampling_rate,
@@ -263,6 +273,7 @@ class GraphTrainer(Trainer):
             dataset,
             batch_size  = train_args.eval_batch_size,
             shuffle     = False,
+            sampler     = ShardSampler(dataset, self.rank, self.world_size) if self.distributed else None,
             num_workers = train_args.num_workers,
         )
 
@@ -294,7 +305,7 @@ class GraphTrainer(Trainer):
         GNN training loop.
 
         Steps each epoch:
-          1. Optional LR decay if epoch is in decay_epochs.
+          1. Optional LR decay if the epoch is scheduled (_apply_lr_decay).
           2. Forward / backward over the training loader.
           3. Evaluation on the training split (unbiased loader).
           4. Evaluation on all registered eval loaders.
@@ -321,15 +332,10 @@ class GraphTrainer(Trainer):
                 logger.info("No checkpoint found, starting from scratch.")
 
         for epoch in range(self.state.epoch, self.args.epochs):
+            if hasattr(self.sampler, "set_epoch"):
+                self.sampler.set_epoch(epoch)
             self.callback_handler.on_epoch_begin(self.args, self.state)
-
-            # ── Optional LR decay ───────────────────────────────────────────
-            if epoch in self.decay_epochs:
-                self.optimizer.update_lr(decay_factor=self.decay_factor)
-                logger.info(
-                    f"Epoch {epoch}: LR decayed by /{self.decay_factor}. "
-                    f"New LR = {self.optimizer.lr:.6f}"
-                )
+            self._apply_lr_decay(epoch)
 
             # ── Training ────────────────────────────────────────────────────
             model.train()
@@ -361,7 +367,7 @@ class GraphTrainer(Trainer):
 
             # ── Evaluation ──────────────────────────────────────────────────
             model.eval()
-            avg_train_loss = float(np.mean(train_loss))
+            avg_train_loss = all_reduce_mean(float(np.mean(train_loss)))
 
             eval_metrics, test_true, test_pred = self.evaluate_loop(model)
 
@@ -415,6 +421,8 @@ class GraphTrainer(Trainer):
 
         y_true = np.concatenate(true_list)
         y_pred = np.concatenate(pred_list)
+        if self.distributed:
+            y_true, y_pred = gather_shards(y_true, y_pred)
 
         if y_pred.ndim > 1:
             y_pred = y_pred.flatten()

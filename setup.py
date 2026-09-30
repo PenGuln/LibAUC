@@ -34,5 +34,11 @@ setuptools.setup(
                       'omegaconf',
                       'transformers',
                       'medmnist',
-                      'pyyaml']
+                      'pyyaml'],
+  extras_require = {
+      # libauc.auto: hyperparameter search (pip install libauc[auto])
+      'auto': ['smac>=2.3', 'ConfigSpace'],
+      # libauc.auto.ui: desktop GUI (pip install libauc[auto,gui])
+      'gui': ['flet==0.24.1', 'psutil'],
+  },
 )
