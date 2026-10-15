@@ -45,7 +45,7 @@ _TERMINATE_GRACE = 10.0
 # Single trial
 # ---------------------------------------------------------------------------
 
-def run_trial(trainer_factory, space, trial_name: str) -> Dict[str, Any]:
+def run_trial(trainer_factory, space, trial_name: str, seeds_per_trial: int = 1) -> Dict[str, Any]:
     """Build a Trainer for *space*, train it, and report where it saved.
 
     Shared by the in-process (serial) path and the trial worker processes.
@@ -53,11 +53,19 @@ def run_trial(trainer_factory, space, trial_name: str) -> Dict[str, Any]:
     so concurrent trials never collide and an interrupted trial can resume
     from its own checkpoints.
 
+    With ``seeds_per_trial`` k > 1 the configuration is trained k times with
+    seeds ``SEED .. SEED + k - 1`` (into ``.../seed<S>``) and the summary is
+    the mean over seeds, a less noisy objective for the search. A seed that
+    already finished (``summary.json`` present) is not retrained on resume.
+
     Returns:
         dict: ``summary`` (``state.train_summary``: ``val`` and optionally
-        ``test``), ``trial_dir`` and ``best_dir`` (where AutoMAX keeps the
-        best trial's checkpoints).
+        ``test``; the seed mean with k > 1), ``trial_dir`` and ``best_dir``
+        (where AutoMAX keeps the best trial's checkpoints), and with k > 1
+        ``seed_summaries`` ({seed: summary}).
     """
+    if seeds_per_trial > 1:
+        return _run_seeds(trainer_factory, space, trial_name, seeds_per_trial)
     trainer = trainer_factory(space)
     base_name = trainer.args.experiment_name
     output_path = trainer.args.output_path
@@ -70,7 +78,46 @@ def run_trial(trainer_factory, space, trial_name: str) -> Dict[str, Any]:
     }
 
 
-def _trial_worker(trainer_factory, space, trial_name, key, result_queue, log_path):
+def _run_seeds(trainer_factory, space, trial_name: str, k: int) -> Dict[str, Any]:
+    import json
+    if not hasattr(trainer_factory, "resolve"):
+        raise ValueError("seeds_per_trial > 1 needs an autopartial trainer factory")
+    seed_summaries, base_name, output_path = {}, None, None
+    for i in range(k):
+        args, kwds = trainer_factory.resolve(space)          # fresh arguments per seed
+        train_args = kwds.get("train_args")
+        if train_args is None or not hasattr(train_args, "SEED"):
+            raise ValueError("seeds_per_trial > 1 needs a Trainer built with train_args (TrainingArguments)")
+        base_name, output_path = train_args.experiment_name, train_args.output_path
+        seed = int(train_args.SEED) + i
+        train_args.SEED = seed
+        train_args.experiment_name = os.path.join(f"{base_name}_{trial_name}", f"seed{seed}")
+        done = os.path.join(output_path, train_args.experiment_name, "summary.json")
+        if os.path.exists(done):                            # finished before an interruption
+            with open(done) as f:
+                seed_summaries[seed] = json.load(f)
+            logger.info(f"{trial_name}: seed {seed} already finished, reusing {done}")
+            continue
+        trainer = trainer_factory.autofunc(*args, **kwds)
+        trainer.train()
+        summary = {k_: float(v) for k_, v in dict(trainer.state.train_summary).items()}
+        seed_summaries[seed] = summary
+        if getattr(trainer, "is_world_process_zero", True):
+            os.makedirs(os.path.dirname(done), exist_ok=True)
+            with open(done, "w") as f:
+                json.dump(summary, f)
+        del trainer
+    keys = set.intersection(*(set(s) for s in seed_summaries.values()))
+    mean = {k_: sum(s[k_] for s in seed_summaries.values()) / len(seed_summaries) for k_ in sorted(keys)}
+    return {
+        "summary":        mean,
+        "seed_summaries": seed_summaries,
+        "trial_dir":      os.path.join(output_path, f"{base_name}_{trial_name}"),
+        "best_dir":       os.path.join(output_path, base_name + "_best"),
+    }
+
+
+def _trial_worker(trainer_factory, space, trial_name, key, result_queue, log_path, seeds_per_trial=1):
     """Entry point of one rank of one trial (runs in a child process).
 
     *trainer_factory* is the trainer itself (``fork``) or the path of its
@@ -110,7 +157,7 @@ def _trial_worker(trainer_factory, space, trial_name, key, result_queue, log_pat
             torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
         if world_size > 1:
             init_distributed()
-        result = run_trial(trainer_factory, space, trial_name)
+        result = run_trial(trainer_factory, space, trial_name, seeds_per_trial)
         if rank == 0:
             result_queue.put((key, rank, True, result))
     except BaseException:
@@ -238,11 +285,13 @@ class TrialPool:
     blocks forever writing a large payload to a child that dies early).
     """
 
-    def __init__(self, trainer_factory, slots: List[List[str]], log_dir: str, start_method: str = "spawn"):
+    def __init__(self, trainer_factory, slots: List[List[str]], log_dir: str, start_method: str = "spawn",
+                 seeds_per_trial: int = 1):
         self._slots = slots
         self._free = list(range(len(slots)))
         self._running: Dict[Hashable, _Running] = {}
         self._log_dir = log_dir
+        self._seeds_per_trial = int(seeds_per_trial)
         os.makedirs(log_dir, exist_ok=True)
 
         self.start_method = start_method
@@ -309,7 +358,7 @@ class TrialPool:
             }
             proc = self._ctx.Process(
                 target=_trial_worker,
-                args=(self._trainer_factory, space, trial_name, key, self._queue, log_path),
+                args=(self._trainer_factory, space, trial_name, key, self._queue, log_path, self._seeds_per_trial),
                 name=f"automax-{trial_name}-rank{rank}",
                 # Not a daemon: trial processes need their own DataLoader workers.
                 daemon=False,

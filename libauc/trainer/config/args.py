@@ -89,6 +89,11 @@ class TrainingArguments:
         self.sampling_rate     = kwargs.pop("sampling_rate")
         self.epochs            = kwargs.pop("epochs")
 
+        # Early stopping on the first eval set's first metric (``None``: off).
+        # When enabled, the best epoch is also saved as ``best.pt``.
+        self.early_stopping_patience  = kwargs.pop("early_stopping_patience", None)
+        self.early_stopping_min_delta = kwargs.pop("early_stopping_min_delta", 0.0)
+
         # Convert fractional decay epochs to absolute epoch indices
         self.decay_epochs = kwargs.pop("decay_epochs")
         for i in range(len(self.decay_epochs)):
@@ -163,7 +168,11 @@ def parse_defaultconfig(type_name: str, multilabel: bool = False, kwargs: dict =
     +-----------------------------+------------------------------+
     | ``MIDAMLoss`` / ``MIDAM``   | ``MIDAMAttentionLossSpace``  |
     |                             | (``MIDAMSoftmaxLossSpace``   |
-    |                             | when mode ``softmax``)       |
+    |                             | when mode ``softmax``;       |
+    |                             | ``MultiLabelMIDAMLossSpace`` |
+    |                             | when ``multilabel=True``)    |
+    +-----------------------------+------------------------------+
+    | ``MultiLabelMIDAMLoss``     | ``MultiLabelMIDAMLossSpace`` |
     +-----------------------------+------------------------------+
 
     Args:
@@ -233,6 +242,10 @@ def parse_defaultconfig(type_name: str, multilabel: bool = False, kwargs: dict =
         from .spaces import AdamSpace as Sp
     elif type_name in ('BCELoss',):
         from .spaces import BCELossSpace as Sp
+    elif type_name == 'MultiLabelMIDAMLoss' or (
+        type_name in ('MIDAMLoss', 'MIDAM') and multilabel
+    ):
+        from .spaces import MultiLabelMIDAMLossSpace as Sp
     elif type_name in ('MIDAMLoss', 'MIDAM'):
         if kwargs.get('mode', 'attention') == 'softmax':
             from .spaces import MIDAMSoftmaxLossSpace as Sp

@@ -9,6 +9,11 @@ Parallel search (4 trials at once, 1 GPU each; or 2 at once with 2-GPU DDP)::
 
     python -m libauc.auto.run_auto_trainer --config_file config.yaml --n_workers 4
     python -m libauc.auto.run_auto_trainer --config_file config.yaml --n_workers 2 --gpus_per_trial 2
+
+Multi-node search (trials run one after another, each with DDP on every
+rank of the ``torchrun`` job)::
+
+    torchrun --nnodes 8 --nproc_per_node 2 ... -m libauc.auto.run_auto_trainer --config_file config.yaml
 """
 
 import argparse
@@ -22,6 +27,8 @@ import torch
 from omegaconf import OmegaConf
 
 from libauc.trainer import TrainingArguments, CLICallback, Trainer, MILTrainer
+from libauc.trainer import init_distributed, cleanup_distributed
+from libauc.utils import is_distributed
 from libauc.trainer import load_dataset, parse_defaultconfig
 from libauc.trainer.helpers import build_megaconf, build_metric, set_seed
 from libauc.trainer.helpers import apply_cli_overrides as _apply_training_cli_overrides
@@ -58,6 +65,8 @@ _MEGACONF_DEFAULTS = {
         "eval_batch_size":        128,
         "sampling_rate":          0.5,
         "epochs":                 50,
+        "early_stopping_patience":  None,  # epochs without val improvement; None: off
+        "early_stopping_min_delta": 0.0,
         "decay_epochs":           [],
         "num_workers":            2,
         "output_path":            "./output",
@@ -80,12 +89,19 @@ _MEGACONF_DEFAULTS = {
         "gpus_per_trial":   1,     # >1: each trial trains with DDP
         "devices":          None,  # GPU ids to use (default: all visible)
         "start_method":     "spawn",
+        "seeds_per_trial":  1,     # seeds per configuration; SMAC sees their mean score
+        "keep_top_k":       1,     # checkpoints of the k best trials are kept (+ <name>_top<k>.json)
     },
     "dataset": {
         "name":        "",
         "kwargs":      {},
         "eval_splits": ["val"],
     },
+    # type: image | mil (default: mil for MIDAM losses, image otherwise).
+    # num_slices (mil, study-level datasets): slices sampled per study per step.
+    "trainer":       {},
+    # Per-split transform lists for custom_csv / medical_study_csv datasets.
+    "preprocessing": {},
     "model": {
         "name":        "resnet18",
         "pretrained":  False,
@@ -130,6 +146,10 @@ def parse_args():
                         help="GPUs per trial; >1 trains each trial with DDP.")
     parser.add_argument("--devices",        type=int, nargs="+", default=None,
                         help="GPU ids to use, e.g. --devices 0 1 2 3 (default: all visible).")
+    parser.add_argument("--seeds_per_trial", type=int, default=None,
+                        help="Train every configuration with this many seeds; SMAC sees the mean score.")
+    parser.add_argument("--keep_top_k",     type=int, default=None,
+                        help="Keep the checkpoints of the k best trials (ranked in <name>_top<k>.json).")
 
     return parser.parse_args()
 
@@ -144,6 +164,8 @@ _AUTOMAX_CLI_MAP: list[tuple[str, str, str]] = [
     ("automax", "n_workers",      "n_workers"),
     ("automax", "gpus_per_trial", "gpus_per_trial"),
     ("automax", "devices",        "devices"),
+    ("automax", "seeds_per_trial", "seeds_per_trial"),
+    ("automax", "keep_top_k",     "keep_top_k"),
 ]
 
 
@@ -191,6 +213,8 @@ def build_pipeline(
     model_cfg     = cfg_dict["model"]
     metric_names  = cfg_dict.get("metrics",       ["AUROC"])
     metric_kwargs = cfg_dict.get("metric_kwargs", [])
+    trainer_cfg   = cfg_dict.get("trainer") or {}
+    preprocessing = cfg_dict.get("preprocessing") or {}
 
     # 1. Reproducibility
     set_seed(training_cfg.get("SEED", 42))
@@ -200,12 +224,19 @@ def build_pipeline(
     dataset_kwargs = dataset_cfg.get("kwargs", {})
     eval_splits    = dataset_cfg.get("eval_splits", ["val"])
 
-    if dataset_cfg.get("kind") == "custom_csv":
+    dataset_kind   = dataset_cfg.get("kind")
+
+    if dataset_kind == "custom_csv":
         # GUI "Custom Dataset..." option: a user-defined CSV/image-folder
         # layout, loaded via MedicalImageCSVDataset instead of the fixed
         # name registry in libauc.trainer.load_dataset().
         logger.info(f"Loading custom CSV dataset '{dataset_name}' (splits: {eval_splits})")
-        train_dataset, eval_datasets = load_custom_csv_dataset(dataset_kwargs, eval_splits)
+        train_dataset, eval_datasets = load_custom_csv_dataset(dataset_kwargs, eval_splits, preprocessing)
+    elif dataset_kind == "medical_study_csv":
+        # Study-level image bags (one or more series per study) for MILTrainer.
+        from libauc.trainer.data import load_medical_study_csv_datasets
+        logger.info(f"Loading study-level medical dataset '{dataset_name}' (splits: {eval_splits})")
+        train_dataset, eval_datasets = load_medical_study_csv_datasets(dataset_kwargs, eval_splits, preprocessing)
     else:
         logger.info(f"Loading train and {eval_splits} splits of dataset: {dataset_name}")
         train_dataset, eval_datasets = load_dataset(
@@ -244,10 +275,11 @@ def build_pipeline(
             optimizer              = default_optimizer_config["type"],
             loss                   = default_loss_config["type"],
             SEED                   = training_cfg.get("SEED",                42),
-            batch_size             = training_cfg.get("batch_size",          128),
             eval_batch_size        = training_cfg.get("eval_batch_size",     128),
             sampling_rate          = training_cfg.get("sampling_rate",       0.5),
             epochs                 = training_cfg.get("epochs",              50),
+            early_stopping_patience  = training_cfg.get("early_stopping_patience"),
+            early_stopping_min_delta = training_cfg.get("early_stopping_min_delta", 0.0),
             decay_epochs           = training_cfg.get("decay_epochs",        []),
             num_workers            = training_cfg.get("num_workers",         2),
             output_path            = training_cfg.get("output_path",         "./output"),
@@ -258,6 +290,8 @@ def build_pipeline(
             experiment_name        = training_cfg["experiment_name"],
             verbose                = training_cfg.get("verbose",             1),
         ),
+        # batch_size may be a search dimension ({"val": [...]}) like any kwarg.
+        **parse_hyperparameters_from_dict({"batch_size": training_cfg.get("batch_size", 128)}),
         optimizer_kwargs = autopartial(dict, **parse_hyperparameters_from_dict(optimizer_kwargs)),
         loss_kwargs      = autopartial(dict, **parse_hyperparameters_from_dict(loss_kwargs)),
     )
@@ -276,21 +310,44 @@ def build_pipeline(
         gpus_per_trial   = automax_cfg.get("gpus_per_trial",   1),
         devices          = automax_cfg.get("devices"),
         start_method     = automax_cfg.get("start_method",     "spawn"),
+        seeds_per_trial  = automax_cfg.get("seeds_per_trial",  1),
+        keep_top_k       = automax_cfg.get("keep_top_k",       1),
     )
 
     extra_callbacks = callback_factory(automax_args) if callback_factory else []
 
     # 8. Build autopartial Trainer (MILTrainer for multiple instance learning)
-    trainer_kwargs = {}
-    trainer_cls = Trainer
-    if default_loss_config["type"] == "MIDAMLoss":
+    trainer_type = trainer_cfg.get("type")
+    if trainer_type is None:
+        trainer_type = "mil" if default_loss_config["type"] in ("MIDAMLoss", "MultiLabelMIDAMLoss") else "image"
+    trainer_type = str(trainer_type).lower()
+
+    # Hyperparameters of the trainer itself and of the model config (any value
+    # may be a search spec, e.g. model.query_heads: {val: [2, 4, 8]}).
+    trainer_hps = {}
+    if trainer_type == "mil":
         trainer_cls = MILTrainer
-        trainer_kwargs["instance_batch_size"] = training_cfg.get("instance_batch_size", 4)
+        if dataset_kind == "medical_study_csv":
+            trainer_hps["num_slices"] = trainer_cfg.get("num_slices", 16)
+        else:
+            trainer_hps["instance_batch_size"] = trainer_cfg.get(
+                "instance_batch_size", training_cfg.get("instance_batch_size", 4))
+    elif trainer_type == "image":
+        trainer_cls = Trainer
+    else:
+        raise ValueError(f"Unknown trainer.type '{trainer_type}'. Choose 'image' or 'mil'.")
+
+    trainer_kwargs = {}
+    if any(isinstance(v, dict) for v in model_cfg.values()):
+        trainer_hps["model_cfg"] = autopartial(dict, **parse_hyperparameters_from_dict(
+            {k: v for k, v in model_cfg.items() if v is not None}))
+    else:
+        trainer_kwargs["model_cfg"] = model_cfg
+
     logger.info(f"Initialising {trainer_cls.__name__} (autopartial)...")
     trainer = autopartial(
         partial(
             trainer_cls,
-            model_cfg     = model_cfg,
             train_dataset = train_dataset,
             eval_dataset  = eval_datasets if eval_datasets else None,
             metric        = metric_fn,
@@ -298,6 +355,8 @@ def build_pipeline(
             **trainer_kwargs,
         ),
         train_args = train_args,
+        **{k: v if hasattr(v, "autofunc") else parse_hyperparameters_from_dict({k: v})[k]
+           for k, v in trainer_hps.items()},
     )
 
     return trainer, automax_args, metric_names
@@ -316,15 +375,22 @@ def main():
     cfg = apply_cli_overrides(cfg, args)
     cfg_dict = OmegaConf.to_container(cfg, resolve=True)
 
-    # 2. Build the search pipeline and run it
-    trainer, automax_args, metric_names = build_pipeline(cfg_dict)
+    # Under torchrun every rank runs the same search in lockstep and each
+    # trial trains with DDP over all ranks (no-op for a plain launch).
+    init_distributed()
+    try:
+        # 2. Build the search pipeline and run it
+        trainer, automax_args, metric_names = build_pipeline(cfg_dict)
 
-    print("\n[Hyperparameter Space]")
-    for value in trainer.cs.values():
-        print(f"  {value}")
+        if not is_distributed() or torch.distributed.get_rank() == 0:
+            print("\n[Hyperparameter Space]")
+            for value in trainer.cs.values():
+                print(f"  {value}")
 
-    tuner = AutoMAX(trainer, automax_args, target=metric_names[0])
-    tuner.optimize()
+        tuner = AutoMAX(trainer, automax_args, target=metric_names[0])
+        tuner.optimize()
+    finally:
+        cleanup_distributed()
 
 
 if __name__ == "__main__":

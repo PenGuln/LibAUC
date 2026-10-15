@@ -88,7 +88,12 @@ class autopartial:
         # trial processes (see :mod:`libauc.auto.parallel`).
         return _restore_autopartial, (self.autofunc, self.args, self.kwds, self.cs)
 
-    def __call__(self, space, prefix=""):
+    def resolve(self, space, prefix=""):
+        """The ``(args, kwargs)`` this instance would call ``autofunc`` with for *space*.
+
+        Lets a caller adjust a resolved argument (e.g. the seed inside
+        ``train_args``) before calling ``self.autofunc(*args, **kwargs)``.
+        """
         new_args = []
         new_kwds = {}
         for i, arg in enumerate(self.args):
@@ -101,6 +106,10 @@ class autopartial:
                 new_kwds[k] = space[prefix + v.name]
             else:
                 new_kwds[k] = self.kwds[k](space, prefix + f"{k}:")
+        return new_args, new_kwds
+
+    def __call__(self, space, prefix=""):
+        new_args, new_kwds = self.resolve(space, prefix)
         return self.autofunc(*new_args, **new_kwds)
 
 

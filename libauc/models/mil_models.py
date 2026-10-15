@@ -1,3 +1,5 @@
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -218,3 +220,361 @@ def ResNet20_stoc_att(activations='relu', **kwargs):
     return ResNet_stoc_att(BasicBlock, [3, 3, 3], **kwargs)
 
 
+class FoundationEncoder(nn.Module):
+    """Return foundation-model features and optionally freeze the encoder."""
+
+    def __init__(self, model, frozen=False):
+        super().__init__()
+        self.model = model
+        self.frozen = frozen
+        if frozen:
+            for parameter in self.model.parameters():
+                parameter.requires_grad = False
+            self.model.eval()
+
+    def train(self, mode=True):
+        super().train(mode)
+        if self.frozen:
+            self.model.eval()
+        return self
+
+    def forward(self, images):
+        if self.frozen:
+            with torch.no_grad():
+                return self.model(images)
+        return self.model(images)
+
+
+def build_mil_encoder(
+    name,
+    pretrained=False,
+    pretrained_path=None,
+    config_path=None,
+    cache_dir=None,
+    tuning_mode="full_finetune",
+    image_size=224,
+    modality="MRI",
+    body_part="N/A",
+):
+    """Build an image encoder that returns one feature vector per slice."""
+    if name.startswith("resnet"):
+        from . import resnet
+
+        encoder = getattr(resnet, name)(
+            pretrained=pretrained,
+            last_activation=None,
+            num_classes=1,
+        )
+        feature_dim = encoder.fc.in_features
+        encoder.fc = nn.Identity()
+        return encoder, feature_dim
+
+    if name.startswith("coatnet"):
+        import timm
+
+        name = "coatnet_0_rw_224" if name == "coatnet" else name
+        encoder = timm.create_model(name, pretrained=pretrained, num_classes=0)
+        return encoder, encoder.num_features
+
+    if tuning_mode not in {"linear_probe", "full_finetune"}:
+        raise ValueError("tuning_mode must be 'linear_probe' or 'full_finetune'")
+
+    if name == "biovfm":
+        
+        if pretrained_path is None:
+            if cache_dir is None:
+                raise ValueError("BioVFM requires pretrained_path or cache_dir")
+            pretrained_path = os.path.join(
+                cache_dir, "BIOVFM", "pretrained_models", "biovfm_checkpoint.pth"
+            )
+
+        try:
+            from .biovfm import build_biovfm
+        except ImportError as exc:
+            raise ImportError("The 'biovfm' encoder needs libauc/models/biovfm.py and builder_vfm.py, "
+                              "which are not part of this distribution.") from exc
+
+        encoder = build_biovfm(pretrained_path)
+        frozen = tuning_mode == "linear_probe"
+        return FoundationEncoder(encoder, frozen=frozen), encoder.num_features
+
+    if name == "radeo":
+       
+        if not pretrained or pretrained_path is None:
+            raise ValueError("RADEO requires pretrained=true and pretrained_path")
+
+        try:
+            from .radeo import load_radeo
+        except ImportError as exc:
+            raise ImportError("The 'radeo' encoder needs libauc/models/radeo.py, builder_vfm.py and tamevfm/, "
+                              "which are not part of this distribution.") from exc
+
+        encoder, feature_dim = load_radeo(
+            pretrained_path,
+            config_path=config_path,
+            modality=modality,
+            body_part=body_part,
+        )
+        frozen = tuning_mode == "linear_probe"
+        return FoundationEncoder(encoder, frozen=frozen), feature_dim
+
+    timm_name = None
+    if name == "imagenet_vit":
+        timm_name = "vit_base_patch16_224"
+    if name == "omnirad":
+        timm_name = "hf_hub:Snarcy/OmniRad-base"
+
+    if timm_name is not None:
+        if tuning_mode not in {"linear_probe", "full_finetune"}:
+            raise ValueError("tuning_mode must be 'linear_probe' or 'full_finetune'")
+
+        import timm
+
+        kwargs = {
+            "pretrained": pretrained,
+            "num_classes": 0,
+            "img_size": image_size,
+        }
+        cache_dir = cache_dir or os.environ.get("BASELINES_CACHE_DIR")
+        if cache_dir:
+            kwargs["cache_dir"] = cache_dir
+        encoder = timm.create_model(timm_name, **kwargs)
+
+        feature_dim = encoder.num_features
+        frozen = tuning_mode == "linear_probe"
+        return FoundationEncoder(encoder, frozen=frozen), feature_dim
+
+    raise ValueError(f"Unknown MIL encoder: {name}")
+
+
+class MILClassifier(nn.Module):
+    """Apply an image encoder to a study and pool its slice features."""
+
+    def __init__(
+        self,
+        encoder,
+        feature_dim,
+        num_classes=1,
+        pool="mean",
+        attention_dim=128,
+        encoder_chunk_size=64,
+        separate_classifier_heads=False,
+        query_heads=1,
+        query_rmsnorm=True,
+        query_mode=None,
+        num_slots=0,
+    ):
+        super().__init__()
+        self.encoder = encoder
+        self.feature_dim = feature_dim
+        # Optional learned embedding of each window's series slot (e.g. sagittal
+        # fluid vs coronal T1), added to its features before pooling. Zero init:
+        # the model starts out identical to one without it.
+        self.slot_embedding = None
+        if num_slots:
+            self.slot_embedding = nn.Embedding(int(num_slots), feature_dim)
+            nn.init.zeros_(self.slot_embedding.weight)
+        self.pool = pool
+        self.encoder_chunk_size = int(encoder_chunk_size)
+        self.query_heads = int(query_heads)
+        
+        if pool == "query_attention" and query_mode is None:
+            raise ValueError("query_mode is required for query_attention")
+        self.query_mode = query_mode
+
+        class_attention = pool in {"class_attention", "class_gated_attention"}
+
+        # We get class specific pooled vectors 
+        class_query = pool == "query_attention" and query_mode in {
+            "single_query_per_class",
+            "shared_multi_query_class_pools",
+            "class_multi_query_class_pools",
+        }
+
+        self.separate_classifier_heads = (
+            separate_classifier_heads or class_attention or class_query
+        )
+
+        if self.separate_classifier_heads:
+            self.classifiers = nn.ModuleList([
+                nn.Linear(feature_dim, 1) for _ in range(num_classes)
+            ])
+        else:
+            self.classifier = nn.Linear(feature_dim, num_classes)
+
+        if pool in {"attention", "class_attention"}:
+            output_dim = num_classes if class_attention else 1
+            self.attention = nn.Sequential(
+                nn.Linear(feature_dim, attention_dim),
+                nn.Tanh(),
+                nn.Linear(attention_dim, output_dim),
+            )
+        elif pool in {"gated_attention", "class_gated_attention"}:
+            output_dim = num_classes if class_attention else 1
+            self.attention_v = nn.Linear(feature_dim, attention_dim)
+            self.attention_u = nn.Linear(feature_dim, attention_dim)
+            self.attention = nn.Linear(attention_dim, output_dim)
+        elif pool == "query_attention":
+            valid_modes = {
+                "single_query_per_class",
+                "shared_multi_query_single_pool",
+                "shared_multi_query_class_pools",
+                "class_multi_query_class_pools",
+            }
+
+
+            if self.query_mode == "single_query_per_class":
+                query_shape = (num_classes, feature_dim)
+
+            elif self.query_mode == "class_multi_query_class_pools":
+                query_shape = (num_classes, self.query_heads, feature_dim)
+
+            else:
+                query_shape = (self.query_heads, feature_dim)
+
+            self.queries = nn.Parameter(torch.randn(query_shape))
+
+            self.query_norm = (
+                nn.RMSNorm(feature_dim) if query_rmsnorm else nn.Identity()
+            )
+
+            # Packed value projections for all attention heads.
+            # Equivalent to num_heads separate Linear(D, D/num_heads) layers
+            # whose outputs are concatenated into one D-dimensional tensor.
+            self.value_projection = nn.Linear(feature_dim, feature_dim, bias=False)
+
+            if self.query_mode in {
+                "shared_multi_query_class_pools",
+                "class_multi_query_class_pools",
+            }:
+                self.output_projections = nn.ModuleList([
+                    nn.Linear(feature_dim, feature_dim, bias=False)
+                    for _ in range(num_classes)
+                ])
+            elif self.query_mode == "shared_multi_query_single_pool":
+                self.output_projection = nn.Linear(
+                    feature_dim, feature_dim, bias=False
+                )
+        elif pool not in {"mean", "max"}:
+            raise ValueError(
+                "pool must be 'mean', 'max', 'attention', 'gated_attention', "
+                "'class_attention', 'class_gated_attention', "
+                "or 'query_attention'"
+            )
+
+    def forward(self, studies, return_attention=False, return_midam=False, slot_ids=None):
+        batch_size, num_slices, channels, height, width = studies.shape
+        images = studies.reshape(-1, channels, height, width)
+        # forward pass the encoder in chunks to avoid OOM
+        features = torch.cat([
+            self.encoder(images[start:start + self.encoder_chunk_size])
+            for start in range(0, len(images), self.encoder_chunk_size)
+        ])
+        features = features.reshape(batch_size, num_slices, self.feature_dim)
+        if self.slot_embedding is not None and slot_ids is not None:
+            features = features + self.slot_embedding(slot_ids.to(features.device))
+        if self.pool == "mean":
+            study_features = features.mean(dim=1)
+        elif self.pool == "max":
+            study_features = features.amax(dim=1)
+        elif self.pool == "attention":
+            weights = torch.softmax(self.attention(features), dim=1)
+            study_features = (features * weights).sum(dim=1)
+        elif self.pool == "gated_attention":
+            attention = torch.tanh(self.attention_v(features))
+            gate = torch.sigmoid(self.attention_u(features))
+            weights = torch.softmax(self.attention(attention * gate), dim=1)
+            study_features = (features * weights).sum(dim=1)
+        elif self.pool == "query_attention":
+            normalized = self.query_norm(features)
+            values = self.value_projection(normalized)
+
+            if self.query_mode == "single_query_per_class":
+                scores = torch.matmul(normalized, self.queries.transpose(0, 1))
+                weights = torch.softmax(scores / self.feature_dim ** 0.5, dim=1)
+                class_features = (values.unsqueeze(2) * weights.unsqueeze(-1)).sum(dim=1)
+                logits = []
+                for class_id, classifier in enumerate(self.classifiers):
+                    logits.append(classifier(class_features[:, class_id]))
+                logits = torch.cat(logits, dim=1)
+                if return_attention:
+                    return logits, weights
+                return logits
+
+            head_dim = self.feature_dim // self.query_heads
+            values = values.reshape(
+                batch_size, num_slices, self.query_heads, head_dim
+            )
+
+            if self.query_mode == "class_multi_query_class_pools":
+                queries = self.queries.reshape(-1, self.feature_dim)
+                scores = torch.matmul(normalized, queries.transpose(0, 1))
+                scores = scores.reshape(batch_size, num_slices, -1, self.query_heads)
+                weights = torch.softmax(scores / head_dim ** 0.5, dim=1)
+                class_features = (values.unsqueeze(2) * weights.unsqueeze(-1)).sum(dim=1)
+                class_features = class_features.reshape(batch_size, -1, self.feature_dim)
+                logits = []
+                for class_id, classifier in enumerate(self.classifiers):
+                    projected = self.output_projections[class_id](class_features[:, class_id])
+                    logits.append(classifier(projected))
+                logits = torch.cat(logits, dim=1)
+                if return_attention:
+                    return logits, weights
+                return logits
+
+            scores = torch.matmul(normalized, self.queries.transpose(0, 1))
+            weights = torch.softmax(scores / head_dim ** 0.5, dim=1)
+            study_features = (values * weights.unsqueeze(-1)).sum(dim=1)
+            study_features = study_features.reshape(batch_size, self.feature_dim)
+
+            if self.query_mode == "shared_multi_query_class_pools":
+                logits = []
+                for class_id, classifier in enumerate(self.classifiers):
+                    projected = self.output_projections[class_id](study_features)
+                    logits.append(classifier(projected))
+                logits = torch.cat(logits, dim=1)
+                if return_attention:
+                    return logits, weights
+                return logits
+
+            if self.query_mode == "shared_multi_query_single_pool":
+                study_features = self.output_projection(study_features)
+        else:
+            if self.pool == "class_attention":
+                scores = self.attention(features)
+            else:
+                attention = torch.tanh(self.attention_v(features))
+                gate = torch.sigmoid(self.attention_u(features))
+                scores = self.attention(attention * gate)
+
+            if return_midam:
+                if self.pool != "class_attention":
+                    raise ValueError("MIDAM currently supports class_attention only")
+                instance_logits = torch.cat([classifier(features) for classifier in self.classifiers], dim=2)
+                unnormalized_weights = torch.exp(scores)
+                sn = (instance_logits * unnormalized_weights).mean(dim=1)
+                sd = unnormalized_weights.mean(dim=1)
+                return sn, sd
+
+            weights = torch.softmax(scores, dim=1)
+            logits = []
+            for class_id, classifier in enumerate(self.classifiers):
+                class_weights = weights[:, :, class_id].unsqueeze(-1)
+                class_features = (features * class_weights).sum(dim=1)
+                logits.append(classifier(class_features))
+            logits = torch.cat(logits, dim=1)
+            if return_attention:
+                return logits, weights
+            return logits
+
+        if self.separate_classifier_heads:
+            logits = torch.cat([
+                classifier(study_features) for classifier in self.classifiers
+            ], dim=1)
+        else:
+            logits = self.classifier(study_features)
+        if return_attention and self.pool in {
+            "attention", "gated_attention", "query_attention"
+        }:
+            return logits, weights
+        return logits

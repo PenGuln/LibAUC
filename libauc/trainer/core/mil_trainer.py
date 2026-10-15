@@ -1,12 +1,16 @@
 import logging
+from types import SimpleNamespace
 from typing import Callable, List, Mapping, Optional
 
 import numpy as np
 import torch
+import torch.distributed as dist
+from torch.utils.data.distributed import DistributedSampler
 
 from libauc.utils import collate_fn
 
 from ..config.args import TrainingArguments
+from ..data.medical_study_dataset import study_windows
 from .callbacks import TrainerCallback
 from .distributed import ShardSampler, gather_shards
 from .image_trainer import Trainer
@@ -18,6 +22,14 @@ __all__ = ["MILTrainer", "MILHead"]
 
 def _as_tensor(bag) -> torch.Tensor:
     return bag if isinstance(bag, torch.Tensor) else torch.from_numpy(np.asarray(bag))
+
+
+def _gather_keep_grad(tensor: torch.Tensor, rank: int, world_size: int) -> torch.Tensor:
+    """All-gather *tensor* along dim 0, keeping autograd for this rank's part."""
+    parts = [torch.zeros_like(tensor) for _ in range(world_size)]
+    dist.all_gather(parts, tensor.detach().contiguous())
+    parts[rank] = tensor
+    return torch.cat(parts)
 
 
 def _strip_head(model: torch.nn.Module) -> int:
@@ -72,8 +84,15 @@ class MILHead(torch.nn.Module):
 
 class MILTrainer(Trainer):
     r"""
-    Training loop for multiple instance learning (MIL) with
-    :class:`~libauc.losses.MIDAMLoss` and :class:`~libauc.optimizers.MIDAM`.
+    Training loop for multiple instance learning (MIL). It runs in one of two
+    modes:
+
+    * **bag level** (default) — :class:`~libauc.losses.MIDAMLoss` /
+      :class:`~libauc.optimizers.MIDAM` on bags with one binary label, as
+      described below;
+    * **study level** (``num_slices`` set) — multi-label medical studies from
+      :class:`~libauc.trainer.data.MedicalStudyCSVDataset` (one or more image
+      series per study), see *Study-level mode*.
 
     Each sample is a *bag* of instances with one bag-level label. Every
     training step uniformly samples up to ``instance_batch_size`` instances
@@ -101,9 +120,27 @@ class MILTrainer(Trainer):
       bags are scaled to ``[0, 1]``, grayscale is expanded to RGB, and HF
       models get their image processor applied to the sampled instances.
 
+    Study-level mode: each sample is a dict ``{"series", "targets", "index"}``.
+    Every training step draws ``num_slices`` random slices from the study's
+    concatenated series; evaluation scores every slice. The model is a
+    :class:`~libauc.models.MILClassifier` over an encoder from
+    :func:`~libauc.models.build_mil_encoder`, configured by ``model_cfg``:
+    ``name`` (``resnet18``, ``coatnet``, ``radeo``, ``biovfm``, ``omnirad``,
+    ``imagenet_vit``), ``pretrained``, ``pretrained_path``, ``config_path``,
+    ``cache_dir``, ``tuning_mode`` (``full_finetune`` | ``linear_probe``),
+    ``image_size``, ``modality``, ``body_part``, ``pool`` (``mean``, ``max``,
+    ``attention``, ``gated_attention``, ``class_attention``,
+    ``class_gated_attention``, ``query_attention``), ``query_mode``,
+    ``query_heads``, ``query_rmsnorm``, ``attention_dim``,
+    ``separate_classifier_heads`` and ``encoder_chunk_size``. Any loss works;
+    :class:`~libauc.losses.MultiLabelMIDAMLoss` (``pool: class_attention``)
+    trains on the stochastic MIDAM pooling of the sampled slices. Under DDP
+    the MIDAM statistics are gathered over the global batch, so the per-study
+    moving averages and ``a``/``b``/``alpha`` stay identical on every rank.
+
     Args:
-        train_args (TrainingArguments): Training configuration; ``loss`` must be
-            ``"MIDAMLoss"`` and ``optimizer`` ``"MIDAM"``.
+        train_args (TrainingArguments): Training configuration. In bag-level
+            mode ``loss`` must be ``"MIDAMLoss"`` and ``optimizer`` ``"MIDAM"``.
         model_cfg (dict): ``{"name": "ffnn" | "resnet20", ...}``.
         train_dataset: Bag dataset yielding ``(bag, label, index)`` with a
             ``.targets`` attribute, e.g. :class:`~libauc.datasets.CustomDataset`
@@ -118,6 +155,8 @@ class MILTrainer(Trainer):
         smoothing_decay_factor (float): At every LR decay epoch the loss's
             moving-average parameter ``gamma`` is divided by this factor
             (default: ``2``).
+        num_slices (int, optional): Slices sampled per study per training
+            step; setting it selects study-level mode (default: ``None``).
 
     Example::
 
@@ -144,7 +183,9 @@ class MILTrainer(Trainer):
         instance_batch_size:    int                                          = 4,
         smoothing_decay_factor: float                                        = 2.0,
         eval_instance_batch_size: int                                        = 256,
+        num_slices:             Optional[int]                                = None,
     ):
+        self.num_slices               = num_slices
         self.instance_batch_size      = instance_batch_size
         self.smoothing_decay_factor   = smoothing_decay_factor
         self.eval_instance_batch_size = eval_instance_batch_size
@@ -157,6 +198,14 @@ class MILTrainer(Trainer):
             metric        = metric,
             callbacks     = callbacks,
         )
+
+    @property
+    def study_level(self) -> bool:
+        return self.num_slices is not None
+
+    @property
+    def _study_midam(self) -> bool:
+        return self.study_level and self.args.loss == "MultiLabelMIDAMLoss"
 
     @property
     def pooling(self) -> str:
@@ -177,6 +226,9 @@ class MILTrainer(Trainer):
         return _as_tensor(self.train_dataset[0][0])[0]
 
     def _build_model(self, model_cfg: dict):
+        if self.study_level:
+            return self._build_study_model(model_cfg)
+
         from libauc.models import FFNN, FFNN_stoc_att, ResNet20_stoc_att, resnet20
 
         if self.args.loss != "MIDAMLoss":
@@ -223,11 +275,98 @@ class MILTrainer(Trainer):
         logger.info(f"Built MIL model '{name}' for {self.pooling} pooling (bag shape {bag.shape})")
         self.model = model.cuda()
 
+    def _build_study_model(self, model_cfg: dict):
+        from libauc.models import MILClassifier, build_mil_encoder
+
+        # 2.5D windows (adjacent slices as channels) and slot embeddings; off by default.
+        self.window_slices  = int(model_cfg.get("window_slices", 1))
+        self.slot_embedding = bool(model_cfg.get("slot_embedding", False))
+        if self.window_slices not in (1, 3):
+            raise ValueError(f"window_slices must be 1 or 3, got {self.window_slices}")
+
+        if self._study_midam and model_cfg.get("pool") != "class_attention":
+            raise ValueError("MultiLabelMIDAMLoss requires model pool 'class_attention'.")
+
+        encoder, feature_dim = build_mil_encoder(
+            model_cfg.get("name", "resnet18"),
+            pretrained      = model_cfg.get("pretrained", False),
+            pretrained_path = model_cfg.get("pretrained_path"),
+            config_path     = model_cfg.get("config_path"),
+            cache_dir       = model_cfg.get("cache_dir"),
+            tuning_mode     = model_cfg.get("tuning_mode", "full_finetune"),
+            image_size      = model_cfg.get("image_size", 224),
+            modality        = model_cfg.get("modality", "MRI"),
+            body_part       = model_cfg.get("body_part", "N/A"),
+        )
+        self.model = MILClassifier(
+            encoder                   = encoder,
+            feature_dim               = feature_dim,
+            num_classes               = 1 if self.args.num_tasks <= 2 else self.args.num_tasks,
+            pool                      = model_cfg.get("pool", "mean"),
+            attention_dim             = model_cfg.get("attention_dim", 128),
+            encoder_chunk_size        = model_cfg.get("encoder_chunk_size", 64),
+            separate_classifier_heads = model_cfg.get("separate_classifier_heads", False),
+            query_heads               = model_cfg.get("query_heads", 1),
+            query_rmsnorm             = model_cfg.get("query_rmsnorm", True),
+            query_mode                = model_cfg.get("query_mode"),
+            num_slots                 = len(self.train_dataset.series_slots) if self.slot_embedding else 0,
+        )
+        reset_head = bool(model_cfg.get("init_reset_head", False))
+        if model_cfg.get("init_checkpoint"):
+            # Two-stage training (e.g. BCE, then an AUC loss): start from a previous run's weights. The optimizer is
+            # built afterwards, so PESG's epoch-decay reference is this starting point. With init_reset_head the final
+            # per-class classifier is not loaded and keeps its fresh initialisation (LibAUC's two-stage recipe);
+            # everything else must match exactly.
+            state = torch.load(model_cfg["init_checkpoint"], map_location="cpu", weights_only=False)
+            state = state.get("model_state_dict", state)
+            head = ("classifier.", "classifiers.")
+            if reset_head:
+                state = {k: v for k, v in state.items() if not k.startswith(head)}
+            missing, unexpected = self.model.load_state_dict(state, strict=False)
+            bad_missing = [k for k in missing if not (reset_head and k.startswith(head))]
+            if bad_missing or unexpected:
+                raise RuntimeError(f"init_checkpoint does not match the model: missing {bad_missing}, unexpected {unexpected}")
+            logger.info(f"Model initialised from {model_cfg['init_checkpoint']}"
+                        + (f" (classifier re-initialised: {len(missing)} tensors)" if reset_head else ""))
+            if reset_head and model_cfg.get("init_bias_from_prior", False):
+                self._init_bias_from_prior(self.model)
+        elif reset_head:
+            raise ValueError("init_reset_head needs init_checkpoint")
+        elif model_cfg.get("init_bias_from_prior", False):
+            self._init_bias_from_prior(self.model)
+        self.model = self.model.cuda()
+        logger.info(f"Built study-level MIL model '{model_cfg.get('name')}' "
+                    f"(features {feature_dim}, pool {model_cfg.get('pool', 'mean')}, {self.num_slices} slices, "
+                    f"{self.window_slices}-slice windows, slot embedding {self.slot_embedding}, "
+                    f"prior bias {bool(model_cfg.get('init_bias_from_prior', False))})")
+
+    def _init_bias_from_prior(self, model):
+        """Start each class logit at logit(mean training target), so the first steps don't spend on base rates."""
+        targets = np.asarray(self.train_dataset.targets, dtype=np.float64).reshape(len(self.train_dataset.targets), -1)
+        prior = torch.logit(torch.as_tensor(targets.mean(0), dtype=torch.float32).clamp(1e-3, 1 - 1e-3))
+        with torch.no_grad():
+            if model.separate_classifier_heads:
+                for c, head in enumerate(model.classifiers):
+                    head.bias.fill_(float(prior[c]))
+            else:
+                model.classifier.bias.copy_(prior[: model.classifier.bias.numel()])
+        logger.info(f"Classifier bias initialised from training base rates: {np.round(torch.sigmoid(prior).numpy(), 3).tolist()}")
+
+    def _check_ddp_support(self):
+        if self._study_midam:
+            return  # synchronised in _compute_loss / _optimizer_step
+        if self.study_level and self.args.optimizer == "PESG" and self.args.loss in ("AUCMLoss", "MultiLabelAUCMLoss"):
+            return  # PESG all-reduces the a/b gradients; _optimizer_step averages alpha
+        super()._check_ddp_support()
+
     # ------------------------------------------------------------------
     # Data
     # ------------------------------------------------------------------
 
     def _get_train_dataloader(self, train_args: TrainingArguments):
+        if self.study_level:
+            return self._get_study_train_dataloader(train_args)
+
         from libauc.sampler import DualSampler, DistributedDualSampler
 
         sampler_cls = DistributedDualSampler if self.distributed else DualSampler
@@ -241,6 +380,26 @@ class MILTrainer(Trainer):
         )
         return sampler, loader
 
+    def _get_study_train_dataloader(self, train_args: TrainingArguments):
+        # Studies are drawn uniformly (no positive oversampling): with many
+        # labels per study there is no single class to balance.
+        sampler = DistributedSampler(self.train_dataset, shuffle=True, seed=train_args.SEED) if self.distributed else None
+        loader = torch.utils.data.DataLoader(
+            self.train_dataset,
+            batch_size  = train_args.batch_size,
+            shuffle     = sampler is None,
+            sampler     = sampler,
+            num_workers = train_args.num_workers,
+            collate_fn  = list,         # studies differ in slice count
+        )
+        targets = np.asarray(self.train_dataset.targets)
+        binary = (targets.reshape(len(targets), -1) >= 0.5)
+        # The base Trainer reads pos_len / neg_len from the sampler.
+        stats = sampler if sampler is not None else SimpleNamespace()
+        stats.pos_len = binary.sum(0).tolist()
+        stats.neg_len = (~binary).sum(0).tolist()
+        return stats, loader
+
     def _get_eval_dataloader(self, dataset, train_args: TrainingArguments):
         return torch.utils.data.DataLoader(
             dataset,
@@ -248,7 +407,7 @@ class MILTrainer(Trainer):
             shuffle     = False,
             sampler     = ShardSampler(dataset, self.rank, self.world_size) if self.distributed else None,
             num_workers = train_args.num_workers,
-            collate_fn  = collate_fn,
+            collate_fn  = list if self.study_level else collate_fn,
         )
 
     # ------------------------------------------------------------------
@@ -269,6 +428,76 @@ class MILTrainer(Trainer):
             x = self._hf_processor(images=x, return_tensors="pt", do_rescale=False)["pixel_values"]
         return x.cuda()
 
+    def _study_inputs(self, sample, count=None, random=False):
+        """``(windows, slot_ids)`` of one study; every slice as a centre when ``count`` is None."""
+        return study_windows(sample["series"], count=count, random=random,
+                             window_slices=getattr(self, "window_slices", 1))
+
+    def _model_kwargs(self, slot_ids):
+        return {"slot_ids": slot_ids} if getattr(self, "slot_embedding", False) else {}
+
+    def _compute_study_loss(self, model, batch):
+        inputs  = [self._study_inputs(sample, self.num_slices, random=True) for sample in batch]
+        studies = torch.stack([w for w, _ in inputs]).cuda()
+        extra   = self._model_kwargs(torch.stack([s for _, s in inputs]).cuda())
+        y_true = torch.stack([sample["targets"] for sample in batch]).float().cuda()
+        index  = torch.as_tensor([sample["index"] for sample in batch]).cuda()
+
+        if self._study_midam:
+            sn, sd = model(studies, return_midam=True, **extra)
+            if self.distributed:
+                # MIDAM's loss couples the whole batch, so it is computed on the
+                # global batch; gradients flow back through this rank's part only.
+                sn, sd = (_gather_keep_grad(t, self.rank, self.world_size) for t in (sn, sd))
+                y_true, index = (_gather_keep_grad(t, self.rank, self.world_size) for t in (y_true, index))
+            binary  = y_true >= self.loss_fn.label_threshold
+            task_id = torch.where(binary.any(dim=0) & (~binary).any(dim=0))[0]
+            return self.loss_fn((sn, sd), y_true, index=index, task_id=task_id)
+
+        logits = model(studies, **extra)
+        if self.args.loss == "CrossEntropyLoss":
+            return self.loss_fn(logits, y_true)
+        y_pred = torch.sigmoid(logits)
+        if self.args.loss == "BCELoss":
+            return self.loss_fn(y_pred, y_true)
+        # AUC losses compare positives with negatives: binary targets (soft report labels thresholded at 0.5) and, for
+        # multi-label losses, only the findings that have both classes in this batch (a rare finding often has no
+        # positive among a few studies, which would make its term undefined).
+        y_bin = (y_true >= 0.5).float()
+        if y_bin.shape[-1] > 1 and type(self.loss_fn).__name__.startswith("MultiLabel"):
+            task_id = torch.where((y_bin == 1).any(0) & (y_bin == 0).any(0))[0]
+            if len(task_id) == 0:
+                return (y_pred * 0).sum()       # nothing to rank; keeps every DDP rank's backward in step
+            return self.loss_fn(y_pred, y_bin, task_id=task_id, index=index)
+        return self.loss_fn(y_pred, y_bin, index=index)
+
+    def _optimizer_step(self, model, loss):
+        if self.distributed and not self._study_midam and isinstance(getattr(self.loss_fn, "alpha", None), torch.Tensor):
+            # PESG averages a/b gradients over ranks but updates alpha from each rank's own batch; average it so the
+            # ranks keep one shared AUC-margin state.
+            super()._optimizer_step(model, loss)
+            with torch.no_grad():
+                dist.all_reduce(self.loss_fn.alpha.data)
+                self.loss_fn.alpha.data.div_(self.world_size)
+            return
+        if not (self._study_midam and self.distributed):
+            return super()._optimizer_step(model, loss)
+        self.optimizer.zero_grad()
+        loss.backward()
+        # Each rank backpropagated the global loss through its own studies;
+        # DDP averaged those parts, so scale back to their sum. a/b already
+        # see the whole batch on every rank (the all-reduce keeps them equal).
+        for p in model.parameters():
+            if p.grad is not None:
+                p.grad.mul_(self.world_size)
+        for p in (self.loss_fn.a, self.loss_fn.b):
+            if p.grad is not None:
+                dist.all_reduce(p.grad)
+                p.grad.div_(self.world_size)
+        self.optimizer.step()
+        for t in (self.loss_fn.a, self.loss_fn.b, self.loss_fn.alpha):
+            dist.broadcast(t.data, src=0)
+
     def _compute_loss(self, model, batch):
         """Stochastic pooling over ``instance_batch_size`` instances per bag.
 
@@ -276,6 +505,9 @@ class MILTrainer(Trainer):
         sampled instances of all bags go through the model in one forward
         pass (faster, and a single forward per step as DDP expects).
         """
+        if self.study_level:
+            return self._compute_study_loss(model, batch)
+
         bags, labels, index = batch
         sampled, counts = [], []
         for bag in bags:
@@ -301,7 +533,7 @@ class MILTrainer(Trainer):
 
     def _apply_lr_decay(self, epoch: int) -> bool:
         decayed = super()._apply_lr_decay(epoch)
-        if decayed:
+        if decayed and hasattr(self.loss_fn, "update_smoothing"):
             self.loss_fn.update_smoothing(decay_factor=self.smoothing_decay_factor)
         return decayed
 
@@ -321,7 +553,33 @@ class MILTrainer(Trainer):
         tau = self._tau
         return (tau * torch.log(torch.mean(torch.exp(out / tau)))).item()
 
+    def _evaluate_studies(self, loader):
+        net = self.unwrapped_model
+        preds, trues = [], []
+        with torch.no_grad():
+            for batch in loader:
+                for sample in batch:
+                    study, slot_ids = self._study_inputs(sample)            # every slice as a centre
+                    logits = net(study.unsqueeze(0).cuda(), **self._model_kwargs(slot_ids.unsqueeze(0).cuda()))
+                    if self.args.loss == "CrossEntropyLoss" and logits.shape[-1] > 1:
+                        prob = torch.softmax(logits, dim=-1)
+                    else:
+                        prob = torch.sigmoid(logits)
+                    preds.append(prob.cpu().numpy()[0])
+                    trues.append(sample["targets"].numpy())
+        test_pred = np.asarray(preds, dtype=np.float32)
+        test_true = (np.asarray(trues) >= 0.5).astype(np.int64)
+        if self.distributed:
+            test_true, test_pred = gather_shards(test_true, test_pred)
+        # Binary: 1-D scores; multi-label: keep (n_studies, n_labels).
+        if self.args.num_tasks <= 2:
+            test_true, test_pred = test_true.reshape(-1), test_pred.reshape(-1)
+        return self.metric(test_true, test_pred), test_true, test_pred
+
     def evaluate(self, loader, model):
+        if self.study_level:
+            return self._evaluate_studies(loader)
+
         net = self.unwrapped_model
         preds, trues = [], []
         with torch.no_grad():

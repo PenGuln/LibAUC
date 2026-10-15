@@ -45,6 +45,27 @@ python -m libauc.auto.run_auto_trainer --config_file examples/auto/recipes/confi
 - Larger backbones usually need a smaller `lr` than the tutorials' ResNet-20 (e.g. `resnet18` on BreastCancer learns at 5e-3 but not at 5e-2). The search range covers this. Lower `instance_batch_size` if large images run out of GPU memory.
 - Built-in datasets: `musk2` (tabular) and `breastcancer` (histopathology image bags). `val` is a stratified hold-out of the training bags (`dataset.kwargs.val_size`, default 0.2).
 
+### Study-level multi-label MIL (medical imaging)
+
+`MILTrainer` also trains on studies with one or more image series and several labels, e.g. knee MRI with 12 findings. Select this mode with a `medical_study_csv` dataset and a `trainer` section:
+
+```yaml
+dataset:
+  kind: medical_study_csv      # manifest CSV: one row per series (study id, series path, plane, labels)
+trainer:
+  type: mil
+  num_slices: 64               # slices sampled per study per step (may be a search spec)
+model:
+  name: resnet18               # resnet*, coatnet, radeo, biovfm, omnirad, imagenet_vit
+  pool: class_attention        # mean, max, (class_)attention, (class_)gated_attention, query_attention
+```
+
+Any loss works. `MIDAMLoss`/`MIDAM` on multi-label data becomes `MultiLabelMIDAMLoss` (MIDAM attention pooling with one `a`/`b`/`alpha` per label), which requires `pool: class_attention`. Values in `model` and `trainer` (e.g. `query_heads`, `num_slices`) and `training.batch_size` accept search specs like any other hyperparameter. The `preprocessing` section sets per-split transform lists. `pip install "libauc[medical]"` adds the foundation-model backbones' dependencies.
+
+### Early stopping
+
+`training.early_stopping_patience: N` stops a trial after `N` epochs without improvement of the first metric on the first eval split (by more than `early_stopping_min_delta`), and keeps the best epoch as `best.pt`. It works with every trainer.
+
 ## Parallel and distributed search
 
 By default trials run one after another on one GPU. Two settings in the `automax` section (or on the command line) change that:
@@ -83,6 +104,36 @@ How it works: AutoMAX drives SMAC through its ask/tell interface. Whenever a GPU
 - An interrupted search resumes with `overwrite: false` (keep the other settings unchanged). Trials that were running are re-run first. With `resume_from_checkpoint: true`, they continue from their own last checkpoint.
 - If `n_workers × gpus_per_trial` exceeds the number of devices, GPUs are shared between trials. This is useful for small models.
 
+### Robust selection: seeds per trial and top-k checkpoints
+
+On a small validation set, a single training run's score is noisy, and the best of many trials is often just the luckiest. Two `automax` settings counter that:
+
+| Setting | CLI flag | Meaning |
+|---|---|---|
+| `seeds_per_trial` | `--seeds_per_trial` | Train every configuration with this many seeds (`training.SEED`, `SEED+1`, ...); SMAC sees the mean validation score (default `1`). |
+| `keep_top_k` | `--keep_top_k` | Keep the checkpoints of the k best trials instead of only the best one (default `1`). |
+
+With `seeds_per_trial: k`, each trial writes `<output_path>/<experiment_name>_<trial>/seed<S>/` per seed, each with its checkpoints and a `summary.json`. On resume, a seed that already has a `summary.json` isn't retrained. With `keep_top_k: n > 1`, the folders of the n best trials are kept, `<experiment_name>_best` is a symlink to the best one, and `<experiment_name>_top<n>.json` ranks the kept trials with their score, hyperparameters and every seed's checkpoint. That's the list to ensemble: average the predictions of all its checkpoints. Averaging all of them is usually more robust than choosing among them by their individual validation scores.
+
+```yaml
+automax:
+  n_trials: 10
+  seeds_per_trial: 3
+  keep_top_k: 3      # -> 9 checkpoints to ensemble
+```
+
+The cost is `seeds_per_trial` times the training per trial. The seeds of a trial run one after another in its slot; use `n_workers` to run trials in parallel.
+
+### Multi-node search with torchrun
+
+For trials too large for one node, launch the search itself with `torchrun`. Every rank runs the same seeded SMAC search in lockstep, and each trial trains with DDP on all ranks of the job. Rank 0 writes checkpoints and logs. `n_workers` and `gpus_per_trial` must stay at 1 in this mode.
+
+```bash
+srun torchrun --nnodes $SLURM_NNODES --nproc_per_node 2 --rdzv_backend c10d \
+    --rdzv_endpoint $master_addr:$master_port --rdzv_id $SLURM_JOB_ID \
+    -m libauc.auto.run_auto_trainer --config_file cfg.yaml
+```
+
 ### Python API
 
 ```python
@@ -102,7 +153,7 @@ With the default `spawn` start method, the trainer (its datasets, metric and cal
 
 ### Supported loss/optimizer pairs for multi-GPU trials
 
-DDP averages model gradients, but losses with auxiliary state must also be synchronized by LibAUC's distributed-aware losses and optimizers (see `examples/20_Distributed_Training_*`). Supported pairs: `AUCMLoss`/`PESG`, `APLoss`/`SOAP`, `pAUC_CVaR_Loss`/`SOPA`, `pAUC_DRO_Loss`/`SOPAs`, `tpAUC_KL_Loss`/`SOTAs`, `tpAUC_CVaR_loss`/`STACO`, `NDCGLoss`/`SONG`, plus `BCELoss`/`CrossEntropyLoss`. Other pairs still run with a warning, but their loss state is not synchronized across GPUs. Single-GPU trials (`gpus_per_trial: 1`) support every pair, at any `n_workers`.
+DDP averages model gradients, but losses with auxiliary state must also be synchronized by LibAUC's distributed-aware losses and optimizers (see `examples/20_Distributed_Training_*`). Supported pairs: `AUCMLoss`/`PESG`, `APLoss`/`SOAP`, `pAUC_CVaR_Loss`/`SOPA`, `pAUC_DRO_Loss`/`SOPAs`, `tpAUC_KL_Loss`/`SOTAs`, `tpAUC_CVaR_loss`/`STACO`, `NDCGLoss`/`SONG`, `MultiLabelMIDAMLoss`/`MIDAM` (study-level `MILTrainer`), plus `BCELoss`/`CrossEntropyLoss`. Other pairs still run with a warning, but their loss state is not synchronized across GPUs. Single-GPU trials (`gpus_per_trial: 1`) support every pair, at any `n_workers`.
 
 The same DDP support is available to plain LibAUC training without a search:
 

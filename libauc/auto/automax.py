@@ -1,6 +1,8 @@
 """
 AutoMAX optimization framework.
 """
+import glob
+import json
 import os
 import sys
 import time
@@ -12,6 +14,8 @@ from .configuration import AutoMAXConfigration
 import shutil
 from smac.runhistory import StatusType, TrialInfo, TrialValue
 import pickle
+
+import torch.distributed as dist
 
 from .parallel import TrialPool, make_slots, run_trial
 
@@ -36,6 +40,10 @@ class AutoMAX:
     ``config.n_workers`` to evaluate several configurations concurrently and
     ``config.gpus_per_trial`` to train each one with DDP on several GPUs; see
     :mod:`libauc.auto.parallel`.
+
+    Launched under ``torchrun`` (a process group exists when AutoMAX is
+    built), every rank runs the same seeded search in lockstep and each trial
+    trains with DDP across all ranks; rank 0 owns the checkpoints and logs.
     """
 
     def __init__(self, trainer, config: AutoMAXConfigration, target: str):
@@ -55,13 +63,24 @@ class AutoMAX:
         self.target = target
         self.config = config
         self.log = []
+        self.top = []        # kept trials, best first (keep_top_k > 1)
+
+        self.distributed = dist.is_available() and dist.is_initialized()
+        self.rank = dist.get_rank() if self.distributed else 0
+        if self.distributed and config.is_parallel:
+            raise ValueError("n_workers / gpus_per_trial > 1 cannot be combined with a torchrun launch; "
+                             "under torchrun each trial already trains on every rank.")
+        # Each rank keeps its own SMAC state so they don't write the same files.
+        self.smac_directory = config.output_directory
+        if self.rank != 0:
+            self.smac_directory = os.path.join(config.output_directory, f".rank_{self.rank}")
 
         # Setup SMAC scenario. Parallelism is handled by AutoMAX itself
         # (ask/tell + TrialPool), so SMAC always sees a single worker.
         scenario = Scenario(
             self.configspace,
             name=config.name,
-            output_directory=config.output_directory,
+            output_directory=self.smac_directory,
             n_trials=config.n_trials,
             deterministic=config.deterministic,
             seed=config.SEED
@@ -89,11 +108,19 @@ class AutoMAX:
                 (entry["val"] for entry in self.log if entry.get("val") == entry.get("val")),
                 default=float('-inf'),
             )
+            self.top = sorted(
+                ({"trial": e["trial"], "score": float(e["val"]), "dir": e["trial_dir"], "space": dict(e["space"])}
+                 for e in self.log if e.get("trial_dir") and e.get("val") == e.get("val") and os.path.exists(e["trial_dir"])),
+                key=lambda e: -e["score"])[:getattr(config, "keep_top_k", 1)]
 
         assert len(self.log) == self.finished
 
     def _state_path(self) -> str:
-        return os.path.join(self.config.output_directory, self.config.name, "state.pkl")
+        return os.path.join(self.smac_directory, self.config.name, "state.pkl")
+
+    @property
+    def _is_main(self) -> bool:
+        return self.rank == 0
 
     def _trial_name(self, config) -> str:
         # SMAC assigns the config id when the trial is asked, and it is stable
@@ -112,9 +139,15 @@ class AutoMAX:
             Negative score (for minimization)
         """
         trial_name = self._trial_name(space)
-        logger.info(f"Starting {trial_name} ({self.finished + 1}/{self.config.n_trials}) with configuration: {space}.")
+        if self.distributed:
+            configs = [None] * dist.get_world_size()
+            dist.all_gather_object(configs, dict(space))
+            if any(c != configs[0] for c in configs[1:]):
+                raise RuntimeError("AutoMAX ranks selected different configurations.")
+        if self._is_main:
+            logger.info(f"Starting {trial_name} ({self.finished + 1}/{self.config.n_trials}) with configuration: {space}.")
         try:
-            result = run_trial(self.trainer, space, trial_name)
+            result = run_trial(self.trainer, space, trial_name, getattr(self.config, "seeds_per_trial", 1))
         except Exception as exc:
             # SMAC records the trial as crashed; keep the log aligned with it.
             self._record_crash(space, trial_name, str(exc))
@@ -128,21 +161,78 @@ class AutoMAX:
         trail_log["trial"] = trial_name
 
         score = trail_log['val']
+        if self.distributed:
+            # Every rank must tell SMAC the same cost to stay in lockstep.
+            shared = [score]
+            dist.broadcast_object_list(shared, src=0)
+            score = trail_log['val'] = shared[0]
         trial_dir, best_dir = result["trial_dir"], result["best_dir"]
+        trail_log["trial_dir"] = trial_dir
+        if "seed_summaries" in result:
+            trail_log["seed_summaries"] = result["seed_summaries"]
 
-        if score > self.best_score:
-            logger.info(f"Found new best configuration ({trial_name}, val {self.target} = {score:.6f})! Updating the best checkpoint.")
+        if getattr(self.config, "keep_top_k", 1) > 1:
+            if score > self.best_score:
+                self.best_score = score
+                if self._is_main:
+                    logger.info(f"Found new best configuration ({trial_name}, val {self.target} = {score:.6f})!")
+            if self._is_main:
+                self._update_top_k(trial_name, score, trial_dir, best_dir, space)
+        elif score > self.best_score:
+            if self._is_main:
+                logger.info(f"Found new best configuration ({trial_name}, val {self.target} = {score:.6f})! Updating the best checkpoint.")
             self.best_score = score
-            if os.path.exists(best_dir):
-                shutil.rmtree(best_dir)
-            if os.path.exists(trial_dir):
-                os.rename(trial_dir, best_dir)
-        elif os.path.exists(trial_dir):
+            if self._is_main:
+                if os.path.exists(best_dir):
+                    shutil.rmtree(best_dir)
+                if os.path.exists(trial_dir):
+                    os.rename(trial_dir, best_dir)
+        elif self._is_main and os.path.exists(trial_dir):
             # Only the best trial's checkpoints are kept.
             shutil.rmtree(trial_dir)
 
         self._append_log(trail_log)
+        if self.distributed:
+            dist.barrier()
         return -score  # Return negative for minimization
+
+    def _update_top_k(self, trial_name, score, trial_dir, best_dir, space):
+        """Keep the checkpoint folders of the k best trials, point <experiment>_best at the best one and
+        write the ranking (with every seed's checkpoint) to <experiment>_top<k>.json."""
+        k = self.config.keep_top_k
+        if score == score and os.path.exists(trial_dir):
+            self.top.append({"trial": trial_name, "score": float(score), "dir": trial_dir, "space": dict(space)})
+        self.top.sort(key=lambda e: -e["score"])
+        for entry in self.top[k:]:                       # fell out of the top k
+            if os.path.exists(entry["dir"]):
+                shutil.rmtree(entry["dir"])
+        self.top = self.top[:k]
+        if os.path.islink(best_dir):
+            os.unlink(best_dir)
+        elif os.path.exists(best_dir):
+            shutil.rmtree(best_dir)
+        if self.top:
+            os.symlink(os.path.relpath(self.top[0]["dir"], os.path.dirname(best_dir)), best_dir)
+
+        def checkpoints(folder):
+            best = sorted(glob.glob(os.path.join(folder, "**", "best.pt"), recursive=True))
+            if best:
+                return best
+            latest = {}                                  # no early stopping: last epoch of each run
+            for path in glob.glob(os.path.join(folder, "**", "epoch_*.pt"), recursive=True):
+                epoch = int(os.path.basename(path)[6:-3])
+                run = os.path.dirname(path)
+                if epoch > latest.get(run, (-1, None))[0]:
+                    latest[run] = (epoch, path)
+            return sorted(p for _, p in latest.values())
+
+        ranking = [{"rank": r + 1, "trial": e["trial"], "val": e["score"], "dir": e["dir"],
+                    "space": {key: (value.item() if hasattr(value, "item") else value) for key, value in e["space"].items()},
+                    "checkpoints": checkpoints(e["dir"])} for r, e in enumerate(self.top)]
+        path = best_dir[: -len("_best")] + f"_top{k}.json"
+        with open(path, "w") as f:
+            json.dump(ranking, f, indent=1, default=str)
+        logger.info(f"Top {k} trials: " + ", ".join(f"{e['trial']} ({e['score']:.4f})" for e in self.top) + f" -> {path}")
 
     def _record_crash(self, space, trial_name: str, error: str):
         self._append_log({"val": float('nan'), "space": space, "trial": trial_name, "error": error})
@@ -175,6 +265,8 @@ class AutoMAX:
                 self.smac.tell(trial_info, trial_value)
 
             incumbent = self.smac.optimize()
+        if not self._is_main:
+            return incumbent
         logger.info(f"Best configuration found: {incumbent}")
 
         # Print trial history as a table
@@ -201,7 +293,8 @@ class AutoMAX:
         cfg = self.config
         slots = make_slots(cfg.devices, cfg.n_workers, cfg.gpus_per_trial)
         log_dir = os.path.join(cfg.output_directory, cfg.name, "trial_logs")
-        pool = TrialPool(self.trainer, slots, log_dir=log_dir, start_method=cfg.start_method)
+        pool = TrialPool(self.trainer, slots, log_dir=log_dir, start_method=cfg.start_method,
+                         seeds_per_trial=getattr(cfg, "seeds_per_trial", 1))
         logger.info(
             f"Parallel search: {len(slots)} concurrent trial(s), {cfg.gpus_per_trial} GPU(s) each, "
             f"GPU slots {slots}, start method '{pool.start_method}'. Per-trial logs in {log_dir}"

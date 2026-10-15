@@ -11,6 +11,10 @@ class AutoMAXConfigration:
         n_configs (int): Number of configurations evaluated per trial.
         SEED (int): Random seed used by the search algorithm (default: ``0``).
         name (str): Human-readable name for the search run.
+        seeds_per_trial (int): Seeds each configuration is trained with; SMAC
+            sees the mean validation score (default: ``1``).
+        keep_top_k (int): Number of best trials whose checkpoints are kept,
+            listed in ``<experiment>_top<k>.json`` (default: ``1``).
         output_directory (str): Directory where AutoMAX results are written
             (default: ``"./automax_output"``). ``output_path`` is accepted as
             a fallback alias, since shipped recipes historically wrote
@@ -72,6 +76,17 @@ class AutoMAXConfigration:
         self.gpus_per_trial    = int(kwargs.pop("gpus_per_trial", None) or 1)
         self.devices: Optional[List[int]] = kwargs.pop("devices", None)
         self.start_method      = kwargs.pop("start_method", None) or "spawn"
+
+        # ── Robust selection ─────────────────────────────────────────────────
+        # seeds_per_trial: train each configuration with this many seeds and
+        # report their mean to SMAC. keep_top_k: keep the checkpoints of the
+        # k best trials (and a ranked <experiment>_top<k>.json) for ensembling.
+        self.seeds_per_trial   = int(kwargs.pop("seeds_per_trial", None) or 1)
+        self.keep_top_k        = int(kwargs.pop("keep_top_k", None) or 1)
+        if self.seeds_per_trial < 1:
+            raise ValueError(f"seeds_per_trial must be >= 1, got {self.seeds_per_trial}")
+        if self.keep_top_k < 1:
+            raise ValueError(f"keep_top_k must be >= 1, got {self.keep_top_k}")
 
         if self.n_workers < 1:
             raise ValueError(f"n_workers must be >= 1, got {self.n_workers}")

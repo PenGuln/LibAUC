@@ -1,0 +1,65 @@
+# Small end-to-end AutoMAX run for the Vision cluster.
+#
+# This intentionally uses a real LibAUC model, dataset, AUC loss, optimizer,
+# and a non-trivial SMAC search space while keeping every trial short.
+dataset:
+  name: breastmnist
+  eval_splits: [val, test]
+  kwargs:
+    root_path: ./data
+
+model:
+  name: resnet20
+  pretrained: false
+
+metrics:
+  - AUROC
+
+training:
+  project_name: automax
+  experiment_name: vision_dummy_resnet20_auc
+  SEED: 2026
+
+  # BreastMNIST is small, so three epochs are enough for a pipeline test.
+  epochs: 3
+  batch_size: 64
+  eval_batch_size: 128
+  sampling_rate: 0.5
+  num_workers: 4
+  decay_epochs: []
+
+  loss: AUCMLoss
+  loss_kwargs:
+    margin:
+      range: [0.5, 1.5]
+      default: 1.0
+
+  optimizer: PESG
+  optimizer_kwargs:
+    lr:
+      range: [0.0001, 0.1]
+      default: 0.01
+      log: true
+    weight_decay:
+      range: [0.0, 0.0002]
+      default: 0.00001
+    momentum:
+      range: [0.8, 0.99]
+      default: 0.9
+    epoch_decay:
+      range: [0.0, 0.01]
+      default: 0.002
+
+  output_path: ./vision_dummy_output
+  resume_from_checkpoint: false
+  save_checkpoint_every: 3
+  verbose: 1
+
+automax:
+  deterministic: true
+  n_trials: 12
+  n_configs: 1
+  SEED: 42
+  name: vision_dummy_resnet20_auc
+  output_directory: ./vision_dummy_automax
+  overwrite: true

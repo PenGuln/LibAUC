@@ -169,6 +169,35 @@ class MedicalImageCSVDataset(Dataset):
 # Shared transform factories
 # ---------------------------------------------------------------------------
 
+IMAGE_TRANSFORMS = {
+    "resize": transforms.Resize,
+    "center_crop": transforms.CenterCrop,
+    "random_crop": transforms.RandomCrop,
+    "random_resized_crop": transforms.RandomResizedCrop,
+    "horizontal_flip": transforms.RandomHorizontalFlip,
+    "vertical_flip": transforms.RandomVerticalFlip,
+    "rotate": transforms.RandomRotation,
+    "affine": transforms.RandomAffine,
+    "color_jitter": transforms.ColorJitter,
+    "grayscale": transforms.Grayscale,
+    "to_tensor": transforms.ToTensor,
+    "normalize": transforms.Normalize,
+    "random_erasing": transforms.RandomErasing,
+}
+
+
+def _build_image_transform(config):
+    """Build a ``Compose`` from a ``preprocessing`` list of ``{name, **kwargs}``."""
+    result = []
+    for item in config or []:
+        item = dict(item)
+        name = item.pop("name")
+        if "interp" in item:
+            item["interpolation"] = transforms.InterpolationMode(item.pop("interp"))
+        result.append(IMAGE_TRANSFORMS[name](**item))
+    return transforms.Compose(result)
+
+
 def _medical_train_transform(image_size: int = 224) -> transforms.Compose:
     return transforms.Compose([
         transforms.Resize((image_size, image_size), antialias=True),

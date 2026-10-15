@@ -295,11 +295,13 @@ class Trainer:
         The single place the decay schedule is applied (it used to live in
         ``CLICallback``, so a Trainer without that callback never decayed).
         Optimizers with an epoch-level regulariser (PESG's ``model_ref``)
-        also reset their reference model. Returns ``True`` if it decayed.
+        also reset their reference model, except at epoch 0: no step has run
+        yet, so the reset would average zero steps and set the reference to
+        NaN. Returns ``True`` if it decayed.
         """
         if epoch not in self._decay_epochs():
             return False
-        if getattr(self.optimizer, "model_ref", None) is not None:
+        if epoch > 0 and getattr(self.optimizer, "model_ref", None) is not None:
             self.optimizer.update_regularizer(decay_factor=self.decay_factor)
         else:
             self.optimizer.update_lr(decay_factor=self.decay_factor)
@@ -528,7 +530,8 @@ class Trainer:
                 loss_fn = loss_cls(data_len=self.data_len, pos_len=self.pos_len, **train_args.loss_kwargs)
             else:
                 loss_fn = loss_cls(data_len=self.data_len, **train_args.loss_kwargs)
-        elif train_args.loss in ["mAPLoss", "APLoss", "pAUC_DRO_Loss", "tpAUC_KL_Loss", "MIDAMLoss"]:
+        elif train_args.loss in ["mAPLoss", "APLoss", "pAUC_DRO_Loss", "tpAUC_KL_Loss", "MIDAMLoss",
+                                 "MultiLabelMIDAMLoss"]:
             loss_fn = loss_cls(data_len=self.data_len, **train_args.loss_kwargs)
         elif train_args.loss in ["pAUC_CVaR_Loss"]:
             loss_fn = loss_cls(data_len=self.data_len, pos_len=self.pos_len, **train_args.loss_kwargs)
@@ -617,6 +620,10 @@ class Trainer:
             else:
                 logger.info("No checkpoint found in output folder, starting from scratch")
         
+        early_stopping = self.args.early_stopping_patience is not None
+        best_score = float("-inf")
+        epochs_without_improvement = 0
+
         for epoch in range(self.state.epoch, self.args.epochs):
             if hasattr(self.sampler, "set_epoch"):
                 self.sampler.set_epoch(epoch)
@@ -630,11 +637,7 @@ class Trainer:
                 self.callback_handler.on_step_begin(self.args, self.state)
 
                 loss = self._compute_loss(model, batch)
-
-                # Optimizer step
-                self.optimizer.zero_grad()
-                loss.backward()
-                self.optimizer.step()
+                self._optimizer_step(model, loss)
                 step_losses.append(loss.item())
 
                 self.callback_handler.on_step_end(self.args, self.state)
@@ -658,9 +661,30 @@ class Trainer:
                 checkpoint_path = os.path.join(self.args.output_path, self.args.experiment_name, f"epoch_{epoch + 1}.pt")
                 self.save_checkpoint(checkpoint_path)
 
+            # Early stopping on the first metric of the first eval set. Every
+            # rank sees the same gathered metrics, so all ranks stop together.
+            if early_stopping and metrics:
+                score = next(iter(metrics[0].values()))
+                if score > best_score + self.args.early_stopping_min_delta:
+                    best_score = score
+                    epochs_without_improvement = 0
+                    self.save_checkpoint(os.path.join(self.args.output_path, self.args.experiment_name, "best.pt"))
+                else:
+                    epochs_without_improvement += 1
+                if epochs_without_improvement >= self.args.early_stopping_patience:
+                    if self.is_world_process_zero:
+                        logger.info(f"Early stopping at epoch {epoch + 1}; best validation score: {best_score:.4f}")
+                    break
+
         self.callback_handler.on_train_end(self.args, self.state)
 
         return self.state.train_log
+
+    def _optimizer_step(self, model, loss):
+        """Backward *loss* and update the model (override to adjust gradients)."""
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
 
     def _compute_loss(self, model, batch):
         """Forward one training batch and return the loss (override for other data layouts)."""

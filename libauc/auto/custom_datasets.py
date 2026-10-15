@@ -6,10 +6,12 @@ Shared between ``auto_trainer.py``'s ``build_pipeline()`` (actual training,
 run inside the GUI's training-worker subprocess) and the GUI's "Inspect
 Dataset" preview, so both use identical loading logic.
 """
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 
-def load_custom_csv_dataset(kwargs: Dict[str, Any], splits: List[str]) -> Tuple[Any, List[Any]]:
+def load_custom_csv_dataset(
+    kwargs: Dict[str, Any], splits: List[str], preprocessing: Optional[Dict[str, Any]] = None
+) -> Tuple[Any, List[Any]]:
     """
     Build a train dataset + one eval dataset per requested split from a
     user-supplied CSV/image-folder layout, via libauc's
@@ -22,6 +24,10 @@ def load_custom_csv_dataset(kwargs: Dict[str, Any], splits: List[str]) -> Tuple[
             (default ``"image_path"``), ``label_col`` (default ``"label"``),
             ``image_size`` (default ``224``).
         splits: eval splits to build, e.g. ``["val"]``.
+        preprocessing: optional ``preprocessing`` config section: per split
+            (``train``, ``val``/``test``, or ``eval`` for every eval split) a
+            list of ``{name: <transform>, **kwargs}`` replacing the default
+            resize/normalise transform.
 
     Returns:
         ``(train_dataset, eval_datasets)``, matching
@@ -31,7 +37,14 @@ def load_custom_csv_dataset(kwargs: Dict[str, Any], splits: List[str]) -> Tuple[
         MedicalImageCSVDataset,
         _medical_test_transform,
         _medical_train_transform,
+        _build_image_transform,
     )
+
+    preprocessing = preprocessing or {}
+
+    def transform(split, default):
+        config = preprocessing.get(split, preprocessing.get("eval") if split != "train" else None)
+        return _build_image_transform(config) if config is not None else default
 
     image_size = int(kwargs.get("image_size", 224))
     image_root = kwargs.get("image_root", "")
@@ -44,7 +57,7 @@ def load_custom_csv_dataset(kwargs: Dict[str, Any], splits: List[str]) -> Tuple[
 
     train_dataset = MedicalImageCSVDataset(
         source=train_csv, image_root=image_root, image_col=image_col,
-        label_col=label_col, transform=_medical_train_transform(image_size),
+        label_col=label_col, transform=transform("train", _medical_train_transform(image_size)),
     )
 
     split_csv_key = {"val": "val_csv", "test": "test_csv"}
@@ -59,6 +72,6 @@ def load_custom_csv_dataset(kwargs: Dict[str, Any], splits: List[str]) -> Tuple[
             )
         eval_datasets.append(MedicalImageCSVDataset(
             source=csv_path, image_root=image_root, image_col=image_col,
-            label_col=label_col, transform=_medical_test_transform(image_size),
+            label_col=label_col, transform=transform(split, _medical_test_transform(image_size)),
         ))
     return train_dataset, eval_datasets

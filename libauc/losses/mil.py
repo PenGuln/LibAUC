@@ -217,6 +217,102 @@ class MIDAM_attention_pooling_loss(nn.Module):
         loss = gw_p + gw_n + gw_s + ga + gb
         return loss
 
+
+class MultiLabelMIDAMLoss(nn.Module):
+    """MIDAM attention-pooling loss for multi-label bags."""
+
+    def __init__(
+        self,
+        data_len,
+        num_labels,
+        margin=1.0,
+        gamma=0.9,
+        label_threshold=0.5,
+        device=None,
+    ):
+        super().__init__()
+        self.device = device or torch.device(
+            'cuda' if torch.cuda.is_available() else 'cpu'
+        )
+        self.gamma = gamma
+        self.margin = margin
+        self.num_labels = num_labels
+        self.label_threshold = label_threshold
+        self.register_buffer(
+            'sn', torch.ones(data_len, num_labels, device=self.device)
+        )
+        self.register_buffer(
+            'sd', torch.ones(data_len, num_labels, device=self.device)
+        )
+        # Start at the values a, b and alpha converge to for an untrained
+        # model, whose scores sigmoid(sn/sd) are all ~0.5: a = b = 0.5 and
+        # alpha = margin + b - a = margin. Starting from zero instead drags
+        # every score towards 0 (where the sigmoid's gradient vanishes)
+        # before alpha has grown enough to separate positives from negatives.
+        self.a = nn.Parameter(torch.full((num_labels,), 0.5, device=self.device))
+        self.b = nn.Parameter(torch.full((num_labels,), 0.5, device=self.device))
+        self.register_buffer(
+            'alpha', torch.full((num_labels,), float(margin), device=self.device)
+        )
+        self.active_tasks = None
+
+    def update_smoothing(self, decay_factor):
+        self.gamma = self.gamma / decay_factor
+
+    def forward(self, y_pred, y_true, index, task_id=None):
+        sn, sd = y_pred
+        y_true = (y_true >= self.label_threshold).float()
+        index = index.long().reshape(-1)
+
+        self.sn[index] = (1-self.gamma) * self.sn[index] + self.gamma * sn.detach()
+        self.sd[index] = (1-self.gamma) * self.sd[index] + self.gamma * sd.detach()
+
+        if task_id is None:
+            task_id = range(self.num_labels)
+
+        losses = []
+        active_tasks = []
+        for task in task_id:
+            task = int(task)
+            index_p = y_true[:, task] == 1
+            index_n = y_true[:, task] == 0
+            if not index_p.any() or not index_n.any():
+                continue
+
+            a, b, alpha = self.a[task], self.b[task], self.alpha[task]
+            sn_task = sn[:, task]
+            sd_task = sd[:, task]
+            vsn = self.sn[index, task]
+            vsd = self.sd[index, task].clamp_min(1e-8)
+            snd = vsn / vsd
+            snd = torch.sigmoid(snd)
+            gsnd = snd * (1-snd)
+            snd_p = snd[index_p]
+            snd_n = snd[index_n]
+            gsnd_p = gsnd[index_p]
+            gsnd_n = gsnd[index_n]
+            gw_att_p = gsnd_p*(1/vsd[index_p]*sn_task[index_p] - vsn[index_p]/(vsd[index_p]**2)*sd_task[index_p]) 
+            gw_att_n = gsnd_n*(1/vsd[index_n]*sn_task[index_n] - vsn[index_n]/(vsd[index_n]**2)*sd_task[index_n])
+            gw_p = torch.mean(2*(snd_p-a.detach())*gw_att_p)
+            gw_n = torch.mean(2*(snd_n-b.detach())*gw_att_n)
+            gw_s = alpha.detach() * (torch.mean(gw_att_n) - torch.mean(gw_att_p))
+            ga = torch.mean((snd_p - a)**2)
+            gb = torch.mean((snd_n - b)**2)
+            loss = gw_p + gw_n + gw_s + ga + gb
+            losses.append(loss)
+            active_tasks.append(task)
+
+        if not losses:
+            raise ValueError(
+                "MIDAM needs at least one task with positive and negative bags in the global batch."
+            )
+
+        self.active_tasks = torch.tensor(
+            active_tasks, device=sn.device, dtype=torch.long
+        )
+        return torch.stack(losses).mean()
+
+
 class MIDAMLoss(torch.nn.Module):
     r"""
         A high-level wrapper for :obj:`~MIDAM_softmax_pooling_loss` and :obj:`~MIDAM_attention_pooling_loss`.                 
@@ -268,4 +364,3 @@ class MIDAMLoss(torch.nn.Module):
 
     def forward(self, **kwargs):
         return self.loss_fn(**kwargs)
-    

@@ -84,6 +84,7 @@ class MIDAM(torch.optim.Optimizer):
         if weight_decay < 0.0:
             raise ValueError("Invalid weight_decay value: {}".format(weight_decay))
         
+        self.loss_fn = loss_fn
         self.a = None
         self.b = None
         self.alpha = None
@@ -107,10 +108,7 @@ class MIDAM(torch.optim.Optimizer):
         super(MIDAM, self).__init__(self.params, defaults)
         
 
-    def __setstate__(self, state):
-        super(SGD, self).__setstate__(state)
-        for group in self.param_groups:
-            group.setdefault('nesterov', False)
+
     
 
     @torch.no_grad()
@@ -152,8 +150,16 @@ class MIDAM(torch.optim.Optimizer):
 
                 p.add_(d_p, alpha=-group['lr'])
                 
-            if alpha is not None: 
-              alpha.data = torch.clip(alpha.data + group['lr']*((m + b.data - a.data)-alpha.data), min=0.0)
+            if alpha is not None:
+                update = alpha.data + group['lr']*((m + b.data - a.data)-alpha.data)
+                # For Multi-label setting
+                active_tasks = getattr(self.loss_fn, 'active_tasks', None)
+                if active_tasks is None:
+                    alpha.data = torch.clip(update, min=0.0)
+                else:
+                    alpha.data[active_tasks] = torch.clip(
+                        update[active_tasks], min=0.0
+                    )
         self.T = self.T + 1
         return loss
     
@@ -164,6 +170,12 @@ class MIDAM(torch.optim.Optimizer):
         print('Updating regularizer @ T=%s!'%(self.T))       
 
     def __setstate__(self, state):
-        super(SGD, self).__setstate__(state)
+        super(MIDAM, self).__setstate__(state)
         for group in self.param_groups:
             group.setdefault('nesterov', False)
+            # load_state_dict() restores param_groups from the checkpoint,
+            # including copies of the loss's a/b/alpha; point them back at the
+            # live tensors so the alpha update keeps reaching the loss.
+            for key in ('a', 'b', 'alpha'):
+                if getattr(self, key, None) is not None:
+                    group[key] = getattr(self, key)

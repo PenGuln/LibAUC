@@ -631,3 +631,43 @@ class MIDAMSoftmaxLossSpace:
             }
         }
     }
+
+class MultiLabelMIDAMLossSpace:
+    """MIDAM attention pooling with one ``a``/``b``/``alpha`` per label
+    (study-level MIL with :class:`~libauc.losses.MultiLabelMIDAMLoss`)."""
+    optimizer = {
+        "type" : "MIDAM",
+        "space" : {
+            # Plain SGD on the MIDAM surrogate: ~0.1 trains at a reasonable
+            # pace, while 0.01 and below barely move (measured on RSNA knee).
+            "lr" : {
+                "val" : (0.01, 0.5),
+                "default" : 0.1,
+                "log" : True
+            },
+            "momentum" : {
+                "val" : (0.0, 0.9),
+                "default" : 0.0
+            },
+            "weight_decay" : {
+                "val" : (0.0, 0.0002),
+                "default" : 0.0
+            }
+        }
+    }
+    loss = {
+        "type" : "MultiLabelMIDAMLoss",
+        "space" : {
+            "margin" : {
+                "val" : [0.6, 0.8, 1.0],
+                "default" : 1.0
+            },
+            "gamma" : {
+                "val" : [0.1, 0.3, 0.5, 0.7, 0.9],
+                "default" : 0.9
+            },
+            "label_threshold" : {
+                "val" : 0.5
+            }
+        }
+    }
