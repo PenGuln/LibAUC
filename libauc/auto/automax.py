@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import time
+import traceback
 import logging
 from typing import Dict, Any, Optional
 from smac import HyperparameterOptimizationFacade, Scenario
@@ -44,6 +45,13 @@ class AutoMAX:
     Launched under ``torchrun`` (a process group exists when AutoMAX is
     built), every rank runs the same seeded search in lockstep and each trial
     trains with DDP across all ranks; rank 0 owns the checkpoints and logs.
+
+    ``config.n_trials`` counts successful trials. A crashed trial is restarted
+    up to ``config.trial_retries`` times (resuming from its checkpoints when
+    the recipe sets ``resume_from_checkpoint``) and then recorded as crashed,
+    which doesn't use up the budget; so a search resumed after crashes keeps
+    its ``n_trials`` (changing it would make SMAC stop and ask whether to
+    overwrite the run). The search gives up once ``n_trials`` trials crashed.
     """
 
     def __init__(self, trainer, config: AutoMAXConfigration, target: str):
@@ -114,6 +122,31 @@ class AutoMAX:
                 key=lambda e: -e["score"])[:getattr(config, "keep_top_k", 1)]
 
         assert len(self.log) == self.finished
+        self._crashed_before = self.crashed
+        self._reported_give_up = False
+
+    @property
+    def completed(self) -> int:
+        """Trials that finished with a score; only these count toward ``n_trials``."""
+        return sum(1 for entry in self.log if entry.get("val") == entry.get("val"))
+
+    @property
+    def crashed(self) -> int:
+        return len(self.log) - self.completed
+
+    @property
+    def _gave_up(self) -> bool:
+        # Only this run's crashes count: a search resumed after the environment was fixed should go on.
+        return self.crashed - self._crashed_before >= self.config.n_trials
+
+    def _budget_left(self, pending: int = 0) -> bool:
+        if self._gave_up:
+            if self._is_main and not self._reported_give_up:
+                self._reported_give_up = True
+                logger.error(f"{self.crashed - self._crashed_before} trials crashed in this run; stopping the search "
+                             f"(see the crash logs above).")
+            return False
+        return self.completed + pending < self.config.n_trials
 
     def _state_path(self) -> str:
         return os.path.join(self.smac_directory, self.config.name, "state.pkl")
@@ -145,13 +178,8 @@ class AutoMAX:
             if any(c != configs[0] for c in configs[1:]):
                 raise RuntimeError("AutoMAX ranks selected different configurations.")
         if self._is_main:
-            logger.info(f"Starting {trial_name} ({self.finished + 1}/{self.config.n_trials}) with configuration: {space}.")
-        try:
-            result = run_trial(self.trainer, space, trial_name, getattr(self.config, "seeds_per_trial", 1))
-        except Exception as exc:
-            # SMAC records the trial as crashed; keep the log aligned with it.
-            self._record_crash(space, trial_name, str(exc))
-            raise
+            logger.info(f"Starting {trial_name} ({self.completed + 1}/{self.config.n_trials}) with configuration: {space}.")
+        result = run_trial(self.trainer, space, trial_name, getattr(self.config, "seeds_per_trial", 1))
         return self._record_result(space, trial_name, result)
 
     def _record_result(self, space, trial_name: str, result: Dict[str, Any]) -> float:
@@ -258,13 +286,7 @@ class AutoMAX:
                 import torch
                 torch.cuda.set_device(int(self.config.devices[0]))
 
-            for trial_info in self.smac.runhistory.get_running_trials():
-                # Re-run the trial
-                cost = self.train(trial_info.config, seed=trial_info.seed)
-                trial_value = TrialValue(cost=cost, time=0.0)
-                self.smac.tell(trial_info, trial_value)
-
-            incumbent = self.smac.optimize()
+            incumbent = self._optimize_serial()
         if not self._is_main:
             return incumbent
         logger.info(f"Best configuration found: {incumbent}")
@@ -288,6 +310,31 @@ class AutoMAX:
 
         return incumbent
 
+    def _optimize_serial(self):
+        """Ask/tell loop running one trial at a time in this process."""
+        # Trials left running by an interrupted search are re-run first.
+        resubmit = list(self.smac.runhistory.get_running_trials())
+        # Under torchrun a rank-local failure leaves the process group unusable, so don't retry there.
+        retries = 0 if self.distributed else self.config.trial_retries
+        while resubmit or self._budget_left():
+            info = resubmit.pop(0) if resubmit else self.smac.ask()
+            trial_name = self._trial_name(info.config)
+            start = time.time()
+            for attempt in range(retries + 1):
+                try:
+                    cost, status = self.train(info.config, seed=info.seed), StatusType.SUCCESS
+                    break
+                except Exception:
+                    error = traceback.format_exc()
+                    if attempt < retries:
+                        logger.warning(f"{trial_name} crashed; restarting it (retry {attempt + 1}/{retries}):\n{error}")
+                        continue
+                    cost, status = self.smac.scenario.crash_cost, StatusType.CRASHED
+                    self._record_crash(info.config, trial_name, error)
+                    logger.error(f"{trial_name} crashed:\n{error}")
+            self.smac.tell(info, TrialValue(cost=cost, time=time.time() - start, status=status))
+        return self.smac.intensifier.get_incumbent()
+
     def _optimize_parallel(self):
         """Ask/tell loop running up to ``n_workers`` trials concurrently."""
         cfg = self.config
@@ -303,10 +350,11 @@ class AutoMAX:
         # Trials left running by an interrupted search are re-run first.
         resubmit = list(self.smac.runhistory.get_running_trials())
         pending: Dict[str, TrialInfo] = {}
+        attempts: Dict[str, int] = {}
 
         try:
-            while self.finished + len(pending) < cfg.n_trials or pending:
-                while pool.has_free_slot() and self.finished + len(pending) < cfg.n_trials:
+            while pending or resubmit or self._budget_left():
+                while pool.has_free_slot() and (resubmit or self._budget_left(len(pending))):
                     info = resubmit.pop(0) if resubmit else self.smac.ask()
                     trial_name = self._trial_name(info.config)
                     gpus, log_path = pool.submit(trial_name, dict(info.config), trial_name)
@@ -315,12 +363,20 @@ class AutoMAX:
 
                 outcome = pool.wait()
                 info = pending.pop(outcome.key)
+                if not outcome.ok and attempts.get(outcome.key, 0) < cfg.trial_retries and not self._gave_up:
+                    # Often an environment problem (out of memory, a wiped /dev/shm); the
+                    # trial resumes from its own checkpoints when the recipe allows it.
+                    attempts[outcome.key] = attempts.get(outcome.key, 0) + 1
+                    logger.warning(f"{outcome.key} crashed after {outcome.elapsed:.0f}s (see {outcome.log_path}); "
+                                   f"restarting it (retry {attempts[outcome.key]}/{cfg.trial_retries}):\n{outcome.error}")
+                    resubmit.insert(0, info)
+                    continue
                 if outcome.ok:
                     cost = self._record_result(info.config, outcome.key, outcome.result)
                     status = StatusType.SUCCESS
                     summary = ", ".join(f"{k} {self.target} = {v:.6f}" for k, v in outcome.result["summary"].items())
                     logger.info(f"Finished {outcome.key} in {outcome.elapsed:.0f}s: {summary} "
-                                f"[{self.finished}/{cfg.n_trials}]")
+                                f"[{self.completed}/{cfg.n_trials}]")
                 else:
                     cost = self.smac.scenario.crash_cost
                     status = StatusType.CRASHED

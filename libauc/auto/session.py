@@ -22,7 +22,7 @@ class TrainingCancelled(BaseException):
     with its remaining trial budget -- an ``Exception`` subclass raised here
     would NOT actually stop the search. Only exception types SMAC doesn't
     catch (like ``KeyboardInterrupt``, or this class) propagate all the way
-    out of ``smac.optimize()`` to the training worker, which is what "cancel
+    out of ``AutoMAX.optimize()`` to the training worker, which is what "cancel
     aborts the whole session" requires. The worker explicitly catches this
     type first (before any ``except Exception``) so it still shuts down
     cleanly rather than surfacing an unhandled traceback.
@@ -66,7 +66,7 @@ class SessionAwareAutoMAX(AutoMAX):
         )
 
     def train(self, space, seed: int = 0) -> float:
-        trial_num = self.finished + 1
+        trial_num = self.completed + 1
         session = self.session_manager.get_session(self.session_id)
         if session is not None and session.status == "cancelled":
             raise TrainingCancelled(f"Cancelled before trial {trial_num} started")
@@ -91,10 +91,10 @@ class SessionAwareAutoMAX(AutoMAX):
             raise
 
         is_new_best = self.best_score > prev_best
-        is_last_trial = self.finished >= self.config.n_trials
+        is_last_trial = self.completed >= self.config.n_trials
         update_kwargs = {
-            "trial": self.finished,
-            "progress": self.finished / self.config.n_trials if self.config.n_trials else 1.0,
+            "trial": self.completed,
+            "progress": self.completed / self.config.n_trials if self.config.n_trials else 1.0,
         }
         if (is_new_best or is_last_trial) and self.session_callback is not None:
             test_true, test_pred = self.session_callback.get_last_predictions()

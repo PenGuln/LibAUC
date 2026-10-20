@@ -91,6 +91,7 @@ _MEGACONF_DEFAULTS = {
         "start_method":     "spawn",
         "seeds_per_trial":  1,     # seeds per configuration; SMAC sees their mean score
         "keep_top_k":       1,     # checkpoints of the k best trials are kept (+ <name>_top<k>.json)
+        "trial_retries":    1,     # restarts of a crashed trial (from its checkpoints) before it counts as crashed
     },
     "dataset": {
         "name":        "",
@@ -150,6 +151,8 @@ def parse_args():
                         help="Train every configuration with this many seeds; SMAC sees the mean score.")
     parser.add_argument("--keep_top_k",     type=int, default=None,
                         help="Keep the checkpoints of the k best trials (ranked in <name>_top<k>.json).")
+    parser.add_argument("--trial_retries",  type=int, default=None,
+                        help="Restart a crashed trial this many times, resuming from its checkpoints (default 1).")
 
     return parser.parse_args()
 
@@ -166,6 +169,7 @@ _AUTOMAX_CLI_MAP: list[tuple[str, str, str]] = [
     ("automax", "devices",        "devices"),
     ("automax", "seeds_per_trial", "seeds_per_trial"),
     ("automax", "keep_top_k",     "keep_top_k"),
+    ("automax", "trial_retries",  "trial_retries"),
 ]
 
 
@@ -312,6 +316,7 @@ def build_pipeline(
         start_method     = automax_cfg.get("start_method",     "spawn"),
         seeds_per_trial  = automax_cfg.get("seeds_per_trial",  1),
         keep_top_k       = automax_cfg.get("keep_top_k",       1),
+        trial_retries    = automax_cfg.get("trial_retries",    1),
     )
 
     extra_callbacks = callback_factory(automax_args) if callback_factory else []

@@ -112,8 +112,9 @@ How it works: AutoMAX drives SMAC through its ask/tell interface. Whenever a GPU
 
 - Each trial logs to `<output_directory>/<name>/trial_logs/trial<N>.log`. The console shows one line per trial start and finish.
 - Each trial checkpoints to `<output_path>/<experiment_name>_trial<N>`. When a trial finishes, the best trial so far is moved to `<experiment_name>_best` and the other trials' checkpoints are deleted.
-- A crashed trial (exception, out of memory, a failing DDP rank) is reported to SMAC as crashed, and the search continues.
-- An interrupted search resumes with `overwrite: false` (keep the other settings unchanged). Trials that were running are re-run first. With `resume_from_checkpoint: true`, they continue from their own last checkpoint.
+- A crashed trial (exception, out of memory, a failing DDP rank) is stopped together with its DataLoader workers, so they don't hold memory for the next trials. It is then restarted `trial_retries` times (default `1`, CLI `--trial_retries`), continuing from its own last checkpoint with `resume_from_checkpoint: true`. If it still fails, it is reported to SMAC as crashed and the search continues with a new configuration. Under `torchrun` a crashed trial isn't restarted.
+- `n_trials` counts successful trials only; crashed trials don't use up the budget. The search stops early if `n_trials` trials crash in one run.
+- An interrupted search resumes with `overwrite: false`. Keep every other `automax` setting unchanged, including `n_trials`: SMAC treats a changed scenario as a different run and stops to ask whether to overwrite it. Trials that were running are re-run first. With `resume_from_checkpoint: true`, they continue from their own last checkpoint.
 - If `n_workers × gpus_per_trial` exceeds the number of devices, GPUs are shared between trials. This is useful for small models.
 
 ### Robust selection: seeds per trial and top-k checkpoints

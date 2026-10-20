@@ -23,6 +23,7 @@ import logging
 import os
 import pickle
 import queue
+import signal
 import socket
 import sys
 import time
@@ -123,6 +124,15 @@ def _trial_worker(trainer_factory, space, trial_name, key, result_queue, log_pat
     *trainer_factory* is the trainer itself (``fork``) or the path of its
     pickle (``spawn``/``forkserver``; see :class:`TrialPool`).
     """
+    # Lead a process group of our own: DataLoader workers inherit it, so the
+    # pool can stop them together with this rank (see TrialPool._terminate).
+    # Otherwise workers of a killed rank live on as orphans and keep their
+    # memory and shared-memory batches, and the next trials run out of memory.
+    os.setpgrp()
+    # Out of the driver's group, a terminal hang-up no longer reaches us; have
+    # the kernel stop this rank when the driver dies instead (Linux only).
+    _exit_with_parent()
+
     rank = int(os.environ.get("RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
 
@@ -167,6 +177,18 @@ def _trial_worker(trainer_factory, space, trial_name, key, result_queue, log_pat
         raise SystemExit(1)
     finally:
         cleanup_distributed()
+
+
+def _exit_with_parent():
+    try:
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        PR_SET_PDEATHSIG = 1
+        libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
+        if os.getppid() == 1:                     # the driver died before prctl took effect
+            os._exit(1)
+    except (OSError, AttributeError):
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -250,6 +272,21 @@ def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
+
+def _signal_group(pid: Optional[int], sig) -> bool:
+    """Send *sig* to the process group led by trial process *pid*.
+
+    Returns ``False`` when there is no such group (the process has not
+    called ``setpgrp`` yet, or the group is gone).
+    """
+    if pid is None:
+        return False
+    try:
+        os.killpg(pid, sig)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
 
 
 @contextmanager
@@ -436,6 +473,8 @@ class TrialPool:
     def _finish(self, key, run: _Running, ok: bool, error: Optional[str] = None) -> TrialOutcome:
         for p in run.procs:
             p.join(timeout=_TERMINATE_GRACE)
+        for p in run.procs:
+            _signal_group(p.pid, signal.SIGKILL)     # workers that outlived their rank
         del self._running[key]
         self._free.append(run.slot)
         return TrialOutcome(
@@ -449,15 +488,17 @@ class TrialPool:
 
     @staticmethod
     def _terminate(procs):
+        """Stop every rank and its DataLoader workers: SIGTERM, then SIGKILL after a grace period."""
         for p in procs:
-            if p.is_alive():
+            if not _signal_group(p.pid, signal.SIGTERM) and p.is_alive():
                 p.terminate()
         deadline = time.time() + _TERMINATE_GRACE
         for p in procs:
             p.join(timeout=max(0.0, deadline - time.time()))
-            if p.is_alive():
+        for p in procs:
+            if not _signal_group(p.pid, signal.SIGKILL) and p.is_alive():
                 p.kill()
-                p.join()
+            p.join()
 
     def shutdown(self):
         """Terminate every running trial (e.g. on Ctrl-C) and clean up."""
