@@ -1,15 +1,13 @@
 import logging
-import os
-from typing import Callable, List, Mapping, Optional, Union
+from typing import Callable, List, Mapping, Optional
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset
 
 from .image_trainer import Trainer
 from ..config.args import TrainingArguments
-from .callbacks import CallbackHandler, TrainerCallback
-from .distributed import ShardSampler, all_reduce_mean, gather_shards
+from .callbacks import TrainerCallback
+from .distributed import ShardSampler, gather_shards
 
 logger = logging.getLogger(__name__)
 
@@ -201,7 +199,8 @@ class GraphTrainer(Trainer):
                 "Make sure your libauc version includes GNN support."
             )
 
-        _META_KEYS = {"name", "num_tasks", "pretrained", "pretrained_remote", "pretrained_path"}
+        _META_KEYS = {"name", "num_tasks", "pretrained", "pretrained_remote", "pretrained_path",
+                      "init_checkpoint", "init_reset_head", "init_bias_from_prior"}   # not constructor arguments
 
         constructor_kwargs = {
             k: v for k, v in model_cfg.items() if k not in _META_KEYS
@@ -297,104 +296,35 @@ class GraphTrainer(Trainer):
         return torch.sigmoid(logits)
 
     # ------------------------------------------------------------------
-    # Main training loop
+    # Training (the loop itself is Trainer.train)
     # ------------------------------------------------------------------
 
-    def train(self):
-        """
-        GNN training loop.
+    def _compute_loss(self, model, batch):
+        """Loss of one PyG training batch (``_forward`` returns sigmoid probabilities)."""
+        data, targets, index = batch
+        data, targets, index = data.cuda(), targets.cuda(), index.cuda()
+        pred = self._forward(model, data)
+        if self.args.loss == "CrossEntropyLoss":
+            raise ValueError("CrossEntropyLoss not supported for GNNs.")
+        if self.args.loss == "BCELoss":
+            return self.loss_fn(pred, targets.reshape(-1, 1))
+        return self.loss_fn(pred, targets, index=index)
 
-        Steps each epoch:
-          1. Optional LR decay if the epoch is scheduled (_apply_lr_decay).
-          2. Forward / backward over the training loader.
-          3. Evaluation on the training split (unbiased loader).
-          4. Evaluation on all registered eval loaders.
-          5. Callbacks and periodic checkpointing.
+    # ------------------------------------------------------------------
+    # Model config / initialisation hooks (see Trainer._initialize_model)
+    # ------------------------------------------------------------------
 
-        Returns
-        -------
-        list : training log produced by the state / callback system
-        """
+    def _model_cfg_keys(self):
+        return None     # remaining keys are forwarded to the GNN constructor
 
-        self.callback_handler.on_train_begin(self.args, self.state)
-        model        = self.model.cuda()
-        self.loss_fn = self.loss_fn.cuda()
+    def _is_head_key(self, key: str) -> bool:
+        return key.startswith("graph_pred_linear.")
 
-        # Optional checkpoint resume
-        if self.args.resume_from_checkpoint:
-            latest = self.get_latest_checkpoint(
-                os.path.join(self.args.output_path, self.args.experiment_name)
-            )
-            if latest:
-                self.load_checkpoint(latest)
-                logger.info(f"Resuming from epoch {self.state.epoch}")
-            else:
-                logger.info("No checkpoint found, starting from scratch.")
-
-        for epoch in range(self.state.epoch, self.args.epochs):
-            if hasattr(self.sampler, "set_epoch"):
-                self.sampler.set_epoch(epoch)
-            self.callback_handler.on_epoch_begin(self.args, self.state)
-            self._apply_lr_decay(epoch)
-
-            # ── Training ────────────────────────────────────────────────────
-            model.train()
-            train_loss = []
-
-            for batch in self.trainloader:
-                self.callback_handler.on_step_begin(self.args, self.state)
-
-                data, targets, index = batch
-                data = data.cuda()
-                targets = targets.cuda()
-                index = index.cuda()
-                pred    = self._forward(model, data)
-
-                # Compute loss
-                if self.args.loss == "CrossEntropyLoss":
-                    raise ValueError("CrossEntropyLoss not supported for GNNs.")
-                if self.args.loss == "BCELoss":
-                    loss = self.loss_fn(pred, targets.reshape(-1,1))
-                else:
-                    loss = self.loss_fn(pred, targets, index=index)
-
-                self.optimizer.zero_grad()
-                loss.backward()
-                self.optimizer.step()
-                train_loss.append(loss.item())
-
-                self.callback_handler.on_step_end(self.args, self.state)
-
-            # ── Evaluation ──────────────────────────────────────────────────
-            model.eval()
-            avg_train_loss = all_reduce_mean(float(np.mean(train_loss)))
-
-            eval_metrics, test_true, test_pred = self.evaluate_loop(model)
-
-            self.callback_handler.on_epoch_end(
-                self.args,
-                self.state,
-                metrics    = eval_metrics,
-                train_loss = avg_train_loss,
-                lr         = self.optimizer.lr,
-                test_true  = test_true,
-                test_pred  = test_pred,
-            )
-
-            # ── Checkpointing ───────────────────────────────────────────────
-            if (
-                (epoch + 1) % self.args.save_checkpoint_every == 0
-                or (epoch + 1) == self.args.epochs
-            ):
-                ckpt = os.path.join(
-                    self.args.output_path,
-                    self.args.experiment_name,
-                    f"epoch_{epoch + 1}.pt",
-                )
-                self.save_checkpoint(ckpt)
-
-        self.callback_handler.on_train_end(self.args, self.state)
-        return self.state.train_log
+    def _head_layers(self, model):
+        head = getattr(model, "graph_pred_linear", None)
+        if head is None:
+            return super()._head_layers(model)
+        return [head] if isinstance(head, torch.nn.Linear) else [m for m in head.modules() if isinstance(m, torch.nn.Linear)][-1:]
 
     # ------------------------------------------------------------------
     # Evaluation helpers

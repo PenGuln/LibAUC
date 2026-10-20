@@ -132,7 +132,11 @@ class MILTrainer(Trainer):
     ``attention``, ``gated_attention``, ``class_attention``,
     ``class_gated_attention``, ``query_attention``), ``query_mode``,
     ``query_heads``, ``query_rmsnorm``, ``attention_dim``,
-    ``separate_classifier_heads`` and ``encoder_chunk_size``. Any loss works;
+    ``separate_classifier_heads``, ``encoder_chunk_size``, ``window_slices``
+    (``3``: 2.5D windows of adjacent slices) and ``slot_embedding`` (learned
+    embedding of each window's series slot). The ``init_*`` keys
+    (``init_checkpoint``, ``init_reset_head``, ``init_bias_from_prior``) work
+    as for every trainer, see :class:`~libauc.trainer.Trainer`. Any loss works;
     :class:`~libauc.losses.MultiLabelMIDAMLoss` (``pool: class_attention``)
     trains on the stochastic MIDAM pooling of the sampled slices. Under DDP
     the MIDAM statistics are gathered over the global batch, so the per-study
@@ -311,53 +315,42 @@ class MILTrainer(Trainer):
             query_mode                = model_cfg.get("query_mode"),
             num_slots                 = len(self.train_dataset.series_slots) if self.slot_embedding else 0,
         )
-        reset_head = bool(model_cfg.get("init_reset_head", False))
-        if model_cfg.get("init_checkpoint"):
-            # Two-stage training (e.g. BCE, then an AUC loss): start from a previous run's weights. The optimizer is
-            # built afterwards, so PESG's epoch-decay reference is this starting point. With init_reset_head the final
-            # per-class classifier is not loaded and keeps its fresh initialisation (LibAUC's two-stage recipe);
-            # everything else must match exactly.
-            state = torch.load(model_cfg["init_checkpoint"], map_location="cpu", weights_only=False)
-            state = state.get("model_state_dict", state)
-            head = ("classifier.", "classifiers.")
-            if reset_head:
-                state = {k: v for k, v in state.items() if not k.startswith(head)}
-            missing, unexpected = self.model.load_state_dict(state, strict=False)
-            bad_missing = [k for k in missing if not (reset_head and k.startswith(head))]
-            if bad_missing or unexpected:
-                raise RuntimeError(f"init_checkpoint does not match the model: missing {bad_missing}, unexpected {unexpected}")
-            logger.info(f"Model initialised from {model_cfg['init_checkpoint']}"
-                        + (f" (classifier re-initialised: {len(missing)} tensors)" if reset_head else ""))
-            if reset_head and model_cfg.get("init_bias_from_prior", False):
-                self._init_bias_from_prior(self.model)
-        elif reset_head:
-            raise ValueError("init_reset_head needs init_checkpoint")
-        elif model_cfg.get("init_bias_from_prior", False):
-            self._init_bias_from_prior(self.model)
         self.model = self.model.cuda()
         logger.info(f"Built study-level MIL model '{model_cfg.get('name')}' "
                     f"(features {feature_dim}, pool {model_cfg.get('pool', 'mean')}, {self.num_slices} slices, "
-                    f"{self.window_slices}-slice windows, slot embedding {self.slot_embedding}, "
-                    f"prior bias {bool(model_cfg.get('init_bias_from_prior', False))})")
+                    f"{self.window_slices}-slice windows, slot embedding {self.slot_embedding})")
 
-    def _init_bias_from_prior(self, model):
-        """Start each class logit at logit(mean training target), so the first steps don't spend on base rates."""
-        targets = np.asarray(self.train_dataset.targets, dtype=np.float64).reshape(len(self.train_dataset.targets), -1)
-        prior = torch.logit(torch.as_tensor(targets.mean(0), dtype=torch.float32).clamp(1e-3, 1 - 1e-3))
-        with torch.no_grad():
-            if model.separate_classifier_heads:
-                for c, head in enumerate(model.classifiers):
-                    head.bias.fill_(float(prior[c]))
-            else:
-                model.classifier.bias.copy_(prior[: model.classifier.bias.numel()])
-        logger.info(f"Classifier bias initialised from training base rates: {np.round(torch.sigmoid(prior).numpy(), 3).tolist()}")
-
-    def _check_ddp_support(self):
+    def _ddp_synchronised(self) -> bool:
         if self._study_midam:
-            return  # synchronised in _compute_loss / _optimizer_step
-        if self.study_level and self.args.optimizer == "PESG" and self.args.loss in ("AUCMLoss", "MultiLabelAUCMLoss"):
-            return  # PESG all-reduces the a/b gradients; _optimizer_step averages alpha
-        super()._check_ddp_support()
+            return True     # global-batch loss, scaled gradients and a/b/alpha sync in _compute_loss / _optimizer_step
+        return super()._ddp_synchronised()
+
+    # ------------------------------------------------------------------
+    # Model config / initialisation hooks (see Trainer._initialize_model)
+    # ------------------------------------------------------------------
+
+    _STUDY_MODEL_KEYS = frozenset({
+        "name", "pretrained", "pretrained_path", "config_path", "cache_dir", "tuning_mode", "image_size",
+        "modality", "body_part", "pool", "attention_dim", "encoder_chunk_size", "separate_classifier_heads",
+        "query_heads", "query_rmsnorm", "query_mode", "window_slices", "slot_embedding",
+    })
+
+    def _model_cfg_keys(self):
+        if self.study_level:
+            return set(self._STUDY_MODEL_KEYS)
+        return super()._model_cfg_keys() | {"hidden_sizes", "attention_dim"}
+
+    def _is_head_key(self, key: str) -> bool:
+        if self.study_level or isinstance(getattr(self, "model", None), MILHead):
+            return key.startswith(("classifier.", "classifiers."))
+        return super()._is_head_key(key)
+
+    def _head_layers(self, model):
+        if self.study_level:
+            return list(model.classifiers) if model.separate_classifier_heads else [model.classifier]
+        if isinstance(model, MILHead):
+            return [model.classifier]
+        return super()._head_layers(model)
 
     # ------------------------------------------------------------------
     # Data
@@ -472,14 +465,6 @@ class MILTrainer(Trainer):
         return self.loss_fn(y_pred, y_bin, index=index)
 
     def _optimizer_step(self, model, loss):
-        if self.distributed and not self._study_midam and isinstance(getattr(self.loss_fn, "alpha", None), torch.Tensor):
-            # PESG averages a/b gradients over ranks but updates alpha from each rank's own batch; average it so the
-            # ranks keep one shared AUC-margin state.
-            super()._optimizer_step(model, loss)
-            with torch.no_grad():
-                dist.all_reduce(self.loss_fn.alpha.data)
-                self.loss_fn.alpha.data.div_(self.world_size)
-            return
         if not (self._study_midam and self.distributed):
             return super()._optimizer_step(model, loss)
         self.optimizer.zero_grad()

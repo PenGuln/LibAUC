@@ -62,6 +62,18 @@ model:
 
 Any loss works. `MIDAMLoss`/`MIDAM` on multi-label data becomes `MultiLabelMIDAMLoss` (MIDAM attention pooling with one `a`/`b`/`alpha` per label), which requires `pool: class_attention`. Values in `model` and `trainer` (e.g. `query_heads`, `num_slices`) and `training.batch_size` accept search specs like any other hyperparameter. The `preprocessing` section sets per-split transform lists. `pip install "libauc[medical]"` adds the foundation-model backbones' dependencies.
 
+### Model initialisation (all trainers)
+
+Besides each trainer's own architecture keys, the `model` section accepts three initialisation keys for every trainer (image, graph and MIL):
+
+| Key | Meaning |
+|---|---|
+| `init_checkpoint` | Path of a previous run's checkpoint (`best.pt` / `epoch_N.pt`), loaded into the whole model; every tensor must match. |
+| `init_reset_head` | With `init_checkpoint`: don't load the final classification head, so it starts fresh (two-stage training, e.g. BCE, then `AUCMLoss` + `PESG`). |
+| `init_bias_from_prior` | Start the head bias at the logit of each class's training base rate (fresh heads only). |
+
+The weights are loaded before the optimizer is built, so PESG's epoch-decay regulariser is anchored to them. Misspelled model keys produce a warning that names the closest valid key.
+
 ### Early stopping
 
 `training.early_stopping_patience: N` stops a trial after `N` epochs without improvement of the first metric on the first eval split (by more than `early_stopping_min_delta`), and keeps the best epoch as `best.pt`. It works with every trainer.

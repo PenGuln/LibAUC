@@ -22,9 +22,12 @@ logger = logging.getLogger(__name__)
 # models (fc / linear) and HuggingFace models (classifier / head).
 _HEAD_PARTS: frozenset = frozenset({"fc", "linear", "classifier", "head"})
 
-# Losses that need no cross-rank synchronisation beyond DDP's gradient
-# averaging (AUCMLoss's a/b are all-reduced by PESG).
-_DDP_NATIVE_LOSSES: frozenset = frozenset({"AUCMLoss", "BCELoss", "CrossEntropyLoss"})
+# Model-config keys handled by Trainer._initialize_model for every trainer (see the Trainer docstring).
+_INIT_KEYS: frozenset = frozenset({"init_checkpoint", "init_reset_head", "init_bias_from_prior"})
+
+# Losses that need no cross-rank synchronisation beyond DDP's gradient averaging. For the AUC-margin losses PESG
+# all-reduces the a/b gradients and computes alpha from a and b, so all three stay identical on every rank.
+_DDP_NATIVE_LOSSES: frozenset = frozenset({"AUCMLoss", "MultiLabelAUCMLoss", "BCELoss", "CrossEntropyLoss"})
 # Optimizers that update loss parameters without all-reducing them.
 _DDP_UNSYNCED_OPTIMIZERS: frozenset = frozenset({"PDSCA"})
 
@@ -136,6 +139,41 @@ class Trainer:
     sharded across ranks and gathered, and only rank 0 logs and writes
     checkpoints. Callbacks run on every rank; use
     ``state.is_world_process_zero`` to restrict side effects to rank 0.
+    A loss/optimizer pair whose auxiliary state isn't synchronised across
+    ranks triggers a warning (:meth:`_ddp_synchronised`).
+
+    Model config: every trainer reads ``model_cfg`` in two stages.
+
+    1. :meth:`_build_model` builds the architecture from the trainer's own
+       keys (unknown keys are reported, see :meth:`_model_cfg_keys`):
+
+       ==================  =====================================================
+       Trainer             Builder keys
+       ==================  =====================================================
+       ``Trainer``         ``name`` (``resnet20`` / ``resnet18`` /
+                           ``densenet121`` / a HuggingFace repo ID),
+                           ``pretrained`` + ``pretrained_path`` (warm-start the
+                           backbone from a local checkpoint; the head is
+                           dropped), ``pretrained_remote`` (ImageNet weights)
+       ``GraphTrainer``    ``name`` (GNN), ``pretrained`` + ``pretrained_path``
+                           (warm start; ``graph_pred_linear`` is reset); other
+                           keys go to the GNN constructor
+       ``MILTrainer``      bag level: ``name``, ``hidden_sizes``,
+                           ``attention_dim`` (+ the ``Trainer`` keys); study
+                           level: see :class:`~libauc.trainer.MILTrainer`
+       ==================  =====================================================
+
+    2. :meth:`_initialize_model` (all trainers, after building, before the
+       optimizer):
+
+       ========================  ==============================================
+       ``init_checkpoint``       path of a previous run's checkpoint; loaded
+                                 into the whole model, every tensor must match
+       ``init_reset_head``       with ``init_checkpoint``: keep the head freshly
+                                 initialised (two-stage training)
+       ``init_bias_from_prior``  head bias = logit(training base rate) per
+                                 class (fresh heads only)
+       ========================  ==============================================
 
     Args:
         train_args (TrainingArguments): Fully populated training configuration
@@ -227,7 +265,9 @@ class Trainer:
         set_seed(self.args.SEED)
 
         self.train_dataset = train_dataset   # set before _build_model so it
-        self._build_model(model_cfg)         # can infer in_channels from data
+        self._validate_model_cfg(model_cfg)  # can infer in_channels from data
+        self._build_model(model_cfg)
+        self._initialize_model(model_cfg)    # before the optimizer: PESG/MIDAM anchor to these weights
         self.eval_dataset = eval_dataset
         self.state = TrainerState()
         self.state.total_epoch = self.args.epochs
@@ -324,26 +364,106 @@ class Trainer:
         for buf in self.unwrapped_model.buffers():
             dist.broadcast(buf, src=0)
 
-    def _check_ddp_support(self):
-        """Warn when the loss/optimizer pair has no distributed implementation.
+    def _ddp_synchronised(self) -> bool:
+        """Whether this loss/optimizer pair keeps its auxiliary state consistent across DDP ranks.
 
         DDP averages model gradients, but losses with auxiliary state (e.g.
         ``a``/``b``/``alpha`` or per-sample moving averages) must be
         synchronised by the loss/optimizer itself; see LibAUC's
         ``examples/20_Distributed_Training_*`` for the supported pairs.
+        Subclasses that synchronise a pair themselves override this.
         """
         loss_ok = (
             getattr(self.loss_fn, "distributed", False)
             or getattr(getattr(self.loss_fn, "loss_fn", None), "distributed", False)  # pAUCLoss wrapper
             or self.args.loss in _DDP_NATIVE_LOSSES
         )
-        if not loss_ok or self.args.optimizer in _DDP_UNSYNCED_OPTIMIZERS:
+        return loss_ok and self.args.optimizer not in _DDP_UNSYNCED_OPTIMIZERS
+
+    def _check_ddp_support(self):
+        """Warn when the loss/optimizer pair has no distributed implementation (see :meth:`_ddp_synchronised`)."""
+        if not self._ddp_synchronised():
             logger.warning(
                 f"{self.args.loss} / {self.args.optimizer} has no distributed-aware "
                 "implementation in libauc; auxiliary loss/optimizer state will not be "
                 "synchronised across GPUs and results may differ from single-GPU training."
             )
     
+    # ------------------------------------------------------------------
+    # Model config and initialisation (shared by every trainer)
+    # ------------------------------------------------------------------
+
+    def _model_cfg_keys(self) -> Optional[set]:
+        """Model-config keys :meth:`_build_model` understands (``None``: any key is accepted)."""
+        return {"name", "pretrained", "pretrained_remote", "pretrained_path"}
+
+    def _validate_model_cfg(self, model_cfg: dict):
+        """Warn about unknown model-config keys (usually typos) and reject inconsistent init settings."""
+        known = self._model_cfg_keys()
+        if known is not None:
+            import difflib
+            allowed = set(known) | _INIT_KEYS
+            for key in sorted(set(model_cfg) - allowed):
+                close = difflib.get_close_matches(key, sorted(allowed), n=1)
+                logger.warning(f"Unknown model config key '{key}' is ignored by {type(self).__name__}"
+                               + (f" (did you mean '{close[0]}'?)" if close else ""))
+        if model_cfg.get("init_reset_head") and not model_cfg.get("init_checkpoint"):
+            raise ValueError("init_reset_head needs init_checkpoint")
+
+    def _is_head_key(self, key: str) -> bool:
+        """Whether state-dict entry *key* belongs to the final classification head."""
+        return any(part in _HEAD_PARTS for part in key.split("."))
+
+    def _head_layers(self, model: torch.nn.Module) -> List[torch.nn.Linear]:
+        """The head's output ``Linear`` layer(s): one with an output per class, or one single-output layer per class."""
+        return [m for name, m in model.named_modules()
+                if isinstance(m, torch.nn.Linear) and any(part in _HEAD_PARTS for part in name.split("."))]
+
+    def _initialize_model(self, model_cfg: dict):
+        """Initialise ``self.model`` (after :meth:`_build_model`, before the optimizer) from the ``init_*`` keys.
+
+        * ``init_checkpoint``: load a previous run's weights (``model_state_dict`` of a trainer checkpoint) into the
+          whole model; every tensor must match.
+        * ``init_reset_head``: with ``init_checkpoint``, skip the head (:meth:`_is_head_key`), which keeps its fresh
+          initialisation, as in LibAUC's two-stage recipe (e.g. BCE, then an AUC loss).
+        * ``init_bias_from_prior``: start the head bias at ``logit(mean training target)`` per class; ignored when a
+          loaded checkpoint brings its own head.
+        """
+        checkpoint, reset_head = model_cfg.get("init_checkpoint"), bool(model_cfg.get("init_reset_head", False))
+        if checkpoint:
+            state = torch.load(checkpoint, map_location="cpu", weights_only=False)
+            state = state.get("model_state_dict", state)
+            if reset_head:
+                state = {k: v for k, v in state.items() if not self._is_head_key(k)}
+            missing, unexpected = self.model.load_state_dict(state, strict=False)
+            bad_missing = [k for k in missing if not (reset_head and self._is_head_key(k))]
+            if bad_missing or unexpected:
+                raise RuntimeError(f"init_checkpoint does not match the model: missing {bad_missing}, unexpected {unexpected}")
+            logger.info(f"Model initialised from {checkpoint}"
+                        + (f" (head re-initialised: {len(missing)} tensors)" if reset_head else ""))
+        if model_cfg.get("init_bias_from_prior", False) and (not checkpoint or reset_head):
+            self._init_bias_from_prior(self.model)
+
+    def _training_targets(self) -> np.ndarray:
+        """Training labels as ``[n_samples, n_outputs]`` (used for the base-rate bias)."""
+        targets = np.asarray(self.train_dataset.targets, dtype=np.float64)
+        return targets.reshape(len(targets), -1)
+
+    def _init_bias_from_prior(self, model: torch.nn.Module):
+        """Start each class logit at logit(mean training target), so the first steps don't spend on base rates."""
+        prior = torch.logit(torch.as_tensor(self._training_targets().mean(0), dtype=torch.float32).clamp(1e-3, 1 - 1e-3))
+        layers = self._head_layers(model)
+        with torch.no_grad():
+            if len(layers) == 1 and layers[0].bias is not None and layers[0].bias.numel() == len(prior):
+                layers[0].bias.copy_(prior)
+            elif len(layers) == len(prior) and all(l.bias is not None and l.bias.numel() == 1 for l in layers):
+                for layer, value in zip(layers, prior):
+                    layer.bias.fill_(float(value))
+            else:
+                raise ValueError(f"init_bias_from_prior: cannot match {len(prior)} base rates to the head "
+                                 f"({[tuple(l.weight.shape) for l in layers]})")
+        logger.info(f"Classifier bias initialised from training base rates: {np.round(torch.sigmoid(prior).numpy(), 3).tolist()}")
+
     def _build_model(self, model_cfg: dict):
         """
         Build a model from the ``model`` config block.
