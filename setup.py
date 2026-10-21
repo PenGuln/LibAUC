@@ -38,8 +38,8 @@ setuptools.setup(
   extras_require = {
       # libauc.auto: hyperparameter search (pip install libauc[auto])
       'auto': ['smac>=2.3', 'ConfigSpace'],
-      # libauc.auto.ui: desktop GUI (pip install libauc[auto,gui])
-      'gui': ['flet==0.24.1', 'psutil'],
+      # libauc.auto.ui: web GUI (pip install libauc[auto,gui])
+      'gui': ['nicegui>=3.0', 'psutil'],
       # Study-level MIL backbones (RADEO / BioVFM / OmniRad / CoAtNet) and
       # DICOM preprocessing (pip install libauc[medical])
       'medical': ['timm', 'pydicom'],

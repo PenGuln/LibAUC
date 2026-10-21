@@ -1,393 +1,413 @@
 """
-Training session monitoring page for AutoMAX.
+AutoMAX "Sessions" page: every past/running search, with live progress,
+training curves, the best trial's ROC curve, a streaming log tail, and
+cancel/delete controls.
+
+Like the rest of the GUI, this only polls ``SessionManager``'s files -- it
+never talks to a training worker directly.
 """
-
+import json
 import logging
-import threading
-from typing import List, Optional
+import os
+from pathlib import Path
+from typing import Dict, List, Optional
 
-import flet as ft
 import numpy as np
-from sklearn.metrics import roc_curve
+from nicegui import ui
+from sklearn.metrics import auc, roc_curve
 
+from .gui import reap_finished_workers
 from .session_manager import SessionInfo, get_session_manager
+from .theme import CHART_COLORS, duration, relative_time, stat_tile, status_chip, status_dot
 
 logger = logging.getLogger(__name__)
 
+_REFRESH_SECONDS = 2.0
+_LOG_TAIL_BYTES = 256 * 1024
 
-def _safe_update(control):
-    """``control.update()``, but a no-op if not yet attached to a live page
-    (e.g. during headless construction/testing, or a stray background-thread
-    refresh tick that fires just before/after the page transition)."""
-    try:
-        control.update()
-    except AssertionError:
-        pass
+_FILTERS = {"all": "All", "running": "Running", "completed": "Done", "failed": "Failed"}
+
+# Axis/text styling that reads in both light and dark mode.
+_AXIS = {
+    "axisLine": {"lineStyle": {"color": "#8b90a5"}},
+    "axisLabel": {"color": "#8b90a5"},
+    "splitLine": {"lineStyle": {"color": "rgba(139,144,165,.18)"}},
+    "nameTextStyle": {"color": "#8b90a5"},
+}
 
 
-_CHART_COLORS = [ft.colors.BLUE, ft.colors.RED, ft.colors.GREEN, ft.colors.ORANGE, ft.colors.PURPLE]
+def _curve_options(history: List[Dict], metric_names: List[str]) -> dict:
+    """ECharts options for the training curves. History rows restart at
+    epoch 1 for every trial, so points are laid out sequentially and each
+    trial boundary gets a dashed marker line, with loss on the left axis and
+    metrics on the right."""
+    labels, trial_starts = [], []
+    trial, prev_epoch = 0, None
+    for i, row in enumerate(history):
+        if prev_epoch is None or row["epoch"] <= prev_epoch:
+            trial += 1
+            trial_starts.append((i, trial))
+        prev_epoch = row["epoch"]
+        labels.append(f"T{trial} · E{row['epoch']}")
+
+    keys = ["train_loss"] + sorted({k for row in history for k in row} - {"epoch", "train_loss"}, key=lambda k: (k not in metric_names, k))
+    series = []
+    for i, key in enumerate(keys):
+        is_loss = key == "train_loss"
+        s = {
+            "name": key, "type": "line", "smooth": 0.3, "smoothMonotone": "x", "showSymbol": len(history) < 40, "symbolSize": 5,
+            "yAxisIndex": 0 if is_loss else 1,
+            "data": [row.get(key) for row in history],
+            "lineStyle": {"width": 2.5 if not is_loss else 2, "type": "solid" if not is_loss else "dashed"},
+            "color": CHART_COLORS[i % len(CHART_COLORS)],
+        }
+        if i == 0 and len(trial_starts) > 1:
+            s["markLine"] = {
+                "silent": True, "symbol": "none",
+                "lineStyle": {"color": "#8b90a5", "type": "dotted"},
+                "label": {"formatter": "{b}", "color": "#8b90a5", "position": "insideEndTop"},
+                "data": [{"xAxis": idx, "name": f"Trial {t}"} for idx, t in trial_starts[1:]],
+            }
+        series.append(s)
+
+    return {
+        "animation": False,
+        "backgroundColor": "transparent",
+        "grid": {"left": 56, "right": 56, "top": 48, "bottom": 64},
+        "tooltip": {"trigger": "axis", "valueFormatter": "(v) => v == null ? '-' : v.toFixed(4)"},
+        "legend": {"top": 4, "textStyle": {"color": "#8b90a5"}, "icon": "roundRect"},
+        "xAxis": {"type": "category", "data": labels, "boundaryGap": False, **_AXIS},
+        "yAxis": [
+            {"type": "value", "name": "loss", "scale": True, **_AXIS},
+            {"type": "value", "name": "metric", "scale": True, **_AXIS, "splitLine": {"show": False}},
+        ],
+        "dataZoom": [{"type": "inside"}, {"type": "slider", "height": 18, "bottom": 8}],
+        "series": series,
+    }
 
 
-class MonitorPage(ft.Column):
-    """Training session monitoring page."""
+def _roc_options(test_true, test_pred) -> Optional[dict]:
+    y_true = np.asarray(test_true).flatten()
+    y_score = np.asarray(test_pred, dtype=float)
+    if y_score.min() < 0 or y_score.max() > 1:
+        from scipy.special import expit
+        y_score = expit(y_score)
+    y_score = y_score.flatten()
+    if len(np.unique(y_true)) < 2:
+        return None
+    fpr, tpr, _ = roc_curve(y_true, y_score)
+    area = auc(fpr, tpr)
+    return {
+        "animation": False,
+        "backgroundColor": "transparent",
+        "grid": {"left": 56, "right": 24, "top": 40, "bottom": 48},
+        "title": {"text": f"AUC = {area:.4f}", "left": "center", "top": 4, "textStyle": {"fontSize": 13, "color": "#8b90a5"}},
+        "tooltip": {"trigger": "axis", "valueFormatter": "(v) => v.toFixed(3)"},
+        "xAxis": {"type": "value", "name": "FPR", "min": 0, "max": 1, "nameLocation": "middle", "nameGap": 28, **_AXIS},
+        "yAxis": {"type": "value", "name": "TPR", "min": 0, "max": 1, **_AXIS},
+        "series": [
+            {
+                "type": "line", "name": "ROC", "showSymbol": False, "step": "end",
+                "data": [[float(x), float(y)] for x, y in zip(fpr, tpr)],
+                "color": CHART_COLORS[0], "lineStyle": {"width": 2.5},
+                "areaStyle": {"opacity": 0.12},
+            },
+            {
+                "type": "line", "name": "chance", "showSymbol": False, "silent": True,
+                "data": [[0, 0], [1, 1]], "color": "#8b90a5", "lineStyle": {"type": "dashed", "width": 1},
+            },
+        ],
+    }
+
+
+class SessionsPanel:
+    """Two-pane session browser: a filterable list on the left and the
+    selected session's live dashboard on the right."""
 
     def __init__(self):
-        super().__init__()
         self.session_manager = get_session_manager()
         self.sessions: List[SessionInfo] = []
-        self.selected_session: Optional[SessionInfo] = None
+        self.selected_id: Optional[str] = None
+        self.filter = "all"
+        self.detail_tab = "curves"
 
-        self._auto_refresh_active = False
-        self._auto_refresh_timer: Optional[threading.Timer] = None
+        self._list_sig = None
+        self._detail_sig = None
+        self._live_sig = None
+        self._log_pos = 0
+        self.curve_chart: Optional[ui.echart] = None
+        self.log_view: Optional[ui.log] = None
+        self.kpi_box: Optional[ui.element] = None
 
-        self._create_header()
-        self._create_session_list()
-        self._create_session_details()
-        self._create_controls()
+        with ui.element("div").classes("w-full grid grid-cols-1 lg:grid-cols-[360px_minmax(0,1fr)] gap-6 items-start"):
+            with ui.card().props("flat").classes("am-card w-full gap-3"):
+                with ui.row().classes("items-center w-full"):
+                    ui.label("Sessions").classes("text-base font-semibold")
+                    ui.space()
+                    ui.button(icon="refresh", on_click=self.refresh).props("flat round dense").tooltip("Refresh")
+                ui.toggle(_FILTERS, value="all", on_change=self._filter_changed).props(
+                    "dense no-caps unelevated spread toggle-color=primary"
+                ).classes("w-full")
+                self.list_box = ui.column().classes("w-full gap-1 max-h-[70vh] overflow-y-auto")
+            self.detail_box = ui.column().classes("min-w-0 w-full gap-6")
 
-        self._load_sessions_data()
-
-        self.controls = [
-            self.header,
-            ft.Container(
-                content=ft.Row([self.session_list_container, self.session_details_container]),
-                padding=ft.padding.all(20),
-            ),
-            self.controls_container,
-        ]
-
-    # ------------------------------------------------------------------
-    # Layout construction
-    # ------------------------------------------------------------------
-
-    def _create_header(self):
-        self.header = ft.Container(
-            content=ft.Row(
-                [
-                    ft.IconButton(icon=ft.icons.ARROW_BACK, tooltip="Back to Main", on_click=self._go_back, bgcolor=ft.colors.BLUE_100, icon_color=ft.colors.BLUE_700),
-                    ft.Text("Training Session Monitor", size=24, weight=ft.FontWeight.BOLD, color=ft.colors.GREY_800),
-                    ft.IconButton(icon=ft.icons.REFRESH, tooltip="Refresh Sessions", on_click=self._refresh_sessions, bgcolor=ft.colors.GREEN_100, icon_color=ft.colors.GREEN_700),
-                ],
-                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-            ),
-            padding=ft.padding.all(15),
-            margin=ft.margin.only(bottom=15),
-            bgcolor=ft.colors.GREY_50,
-            border_radius=ft.border_radius.all(8),
-        )
-
-    def _create_session_list(self):
-        self.session_list = ft.ListView(height=400, width=400, spacing=5, padding=ft.padding.all(10))
-        self.session_list_container = ft.Container(
-            content=ft.Column([ft.Text("Training Sessions", size=18, weight=ft.FontWeight.BOLD), self.session_list]),
-            width=400, height=500,
-            border=ft.border.all(1, ft.colors.GREY_300), border_radius=ft.border_radius.all(8), padding=ft.padding.all(10),
-        )
-
-    def _create_session_details(self):
-        self.session_details = ft.Column(
-            [ft.Text("Session Details", size=18, weight=ft.FontWeight.BOLD), ft.Text("Select a session to view details", color=ft.colors.GREY_600)],
-            spacing=10, scroll=ft.ScrollMode.AUTO, expand=True,
-        )
-        self.session_details_container = ft.Container(
-            content=self.session_details, width=600, height=500,
-            border=ft.border.all(1, ft.colors.GREY_300), border_radius=ft.border_radius.all(8), padding=ft.padding.all(15),
-        )
-
-    def _create_controls(self):
-        self.controls_container = ft.Container(
-            content=ft.Row(
-                [
-                    ft.ElevatedButton("Cancel Session", icon=ft.icons.STOP, on_click=self._cancel_session, disabled=True, bgcolor=ft.colors.ORANGE_600, color=ft.colors.WHITE),
-                    ft.ElevatedButton("View Logs", icon=ft.icons.DESCRIPTION, on_click=self._view_logs, disabled=True, bgcolor=ft.colors.GREEN_600, color=ft.colors.WHITE),
-                    ft.ElevatedButton("Delete Session", icon=ft.icons.DELETE, on_click=self._delete_session, disabled=True, bgcolor=ft.colors.RED_600, color=ft.colors.WHITE),
-                ],
-                alignment=ft.MainAxisAlignment.CENTER, spacing=15,
-            ),
-            padding=ft.padding.all(15),
-        )
+        self.refresh()
+        ui.timer(_REFRESH_SECONDS, self.refresh)
 
     # ------------------------------------------------------------------
-    # Data loading
+    # Public
     # ------------------------------------------------------------------
 
-    def _load_sessions_data(self):
-        self.sessions = self.session_manager.get_all_sessions()
+    def select(self, session_id: Optional[str]):
+        self.selected_id = session_id
+        self._detail_sig = None
+        self._list_sig = None
+        self.refresh()
 
-    def _load_sessions(self):
-        self._load_sessions_data()
-        self._update_session_list()
-        self._update_session_details()
-        self._update_controls()
+    def refresh(self):
+        reap_finished_workers()
+        self.sessions = sorted(self.session_manager.get_all_sessions(), key=lambda s: s.start_time, reverse=True)
+        if self.selected_id is None and self.sessions:
+            self.selected_id = self.sessions[0].session_id
+        if self.selected_id and not any(s.session_id == self.selected_id for s in self.sessions):
+            self.selected_id = None
+        self._render_list()
+        self._render_detail()
 
-    def _update_session_list(self):
-        self.session_list.controls = []
-        if not self.sessions:
-            self.session_list.controls.append(
-                ft.Container(content=ft.Text("No training sessions found", color=ft.colors.GREY_600), alignment=ft.alignment.center, height=100)
-            )
-        else:
-            for session in self.sessions:
-                self.session_list.controls.append(self._create_session_card(session))
-        _safe_update(self.session_list)
+    @property
+    def selected(self) -> Optional[SessionInfo]:
+        return next((s for s in self.sessions if s.session_id == self.selected_id), None)
 
-    def _create_session_card(self, session: SessionInfo):
-        status_color = {
-            "running": ft.colors.GREEN_600,
-            "completed": ft.colors.BLUE_600,
-            "failed": ft.colors.RED_600,
-            "cancelled": ft.colors.ORANGE_600,
-        }.get(session.status, ft.colors.GREY_600)
+    # ------------------------------------------------------------------
+    # Session list
+    # ------------------------------------------------------------------
 
-        status_display = {
-            "running": "\U0001f504 Running",
-            "completed": "✅ Completed",
-            "failed": "❌ Failed",
-            "cancelled": "⏹ Cancelled",
-        }.get(session.status, session.status.title())
+    def _filter_changed(self, e):
+        self.filter = e.value
+        self._list_sig = None
+        self._render_list()
 
-        return ft.Container(
-            content=ft.Column(
-                [
-                    ft.Row(
-                        [
-                            ft.Text(f"Session: {session.session_id[:8]}...", weight=ft.FontWeight.BOLD),
-                            ft.Container(content=ft.Text(status_display, color=ft.colors.WHITE, size=12), bgcolor=status_color, padding=ft.padding.symmetric(4, 8), border_radius=ft.border_radius.all(4)),
-                        ],
-                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                    ),
-                    ft.Text(f"Name: {session.name}", size=12, color=ft.colors.GREY_700),
-                    ft.Text(f"Backend: {session.backend}  Model: {session.model}", size=12, color=ft.colors.GREY_700),
-                    ft.Text(f"Dataset: {session.dataset}", size=12, color=ft.colors.GREY_700),
-                    ft.Text(f"Metrics: {', '.join(session.metrics)}", size=12, color=ft.colors.GREY_700),
-                    ft.Text(f"Trial: {session.trial}/{session.n_trials}  Progress: {session.progress:.2f}", size=12, color=ft.colors.GREY_700),
-                ],
-                spacing=5,
-            ),
-            padding=ft.padding.all(10),
-            border=ft.border.all(1, ft.colors.GREY_300),
-            border_radius=ft.border_radius.all(6),
-            bgcolor=ft.colors.WHITE,
-            width=380, height=190,
-            on_click=lambda e, s=session: self._select_session(s),
-        )
-
-    def _select_session(self, session: SessionInfo):
-        self.selected_session = session
-        self._update_session_details()
-        self._update_controls()
-
-    def _update_session_details(self):
-        if not self.selected_session:
-            self.session_details.controls = [
-                ft.Text("Session Details", size=18, weight=ft.FontWeight.BOLD),
-                ft.Text("Select a session to view details", color=ft.colors.GREY_600),
-            ]
-            _safe_update(self.session_details)
+    def _render_list(self):
+        visible = [s for s in self.sessions if self.filter == "all" or s.status == self.filter]
+        sig = (self.filter, self.selected_id, tuple((s.session_id, s.status, round(s.progress, 3), s.trial) for s in visible),
+               relative_time(visible[0].start_time) if visible else "")
+        if sig == self._list_sig:
             return
+        self._list_sig = sig
 
-        # Pull the freshest copy in case a background refresh updated it
-        session = self.session_manager.get_session(self.selected_session.session_id) or self.selected_session
-        self.selected_session = session
+        self.list_box.clear()
+        with self.list_box:
+            if not visible:
+                with ui.column().classes("w-full items-center py-10 gap-2 am-muted"):
+                    ui.icon("inbox", size="36px")
+                    ui.label("No sessions here yet")
+                return
+            for s in visible:
+                self._session_item(s)
 
-        details = [
-            ft.Text("Session Details", size=18, weight=ft.FontWeight.BOLD),
-            ft.Divider(),
-            ft.Text(f"Session ID: {session.session_id}", weight=ft.FontWeight.BOLD),
-            ft.Text(f"Name: {session.name}"),
-            ft.Text(f"Status: {session.status.title()}"),
-            ft.Text(f"Backend: {session.backend}"),
-            ft.Text(f"Start Time: {session.start_time}"),
-            ft.Text(f"End Time: {session.end_time or 'N/A'}"),
-            ft.Text(f"Model: {session.model}"),
-            ft.Text(f"Dataset: {session.dataset}"),
-            ft.Text(f"Metrics: {', '.join(session.metrics)}"),
-            ft.Text(f"Trial: {session.trial}/{session.n_trials}"),
-            ft.Text(f"Epochs: {session.current_epoch}/{session.epochs}"),
-            ft.Text(f"Progress: {session.progress:.2f}"),
-            ft.Text(f"Loss: {session.loss:.4f}"),
-        ]
+    def _session_item(self, s: SessionInfo):
+        classes = "am-session w-full p-3 gap-1" + (" am-selected" if s.session_id == self.selected_id else "")
+        with ui.column().classes(classes).on("click", lambda _, sid=s.session_id: self.select(sid)):
+            with ui.row().classes("items-center gap-2 w-full no-wrap"):
+                status_dot(s.status)
+                ui.label(s.name).classes("font-medium text-sm truncate grow")
+                ui.label(relative_time(s.start_time)).classes("text-xs am-muted shrink-0")
+            ui.label(f"{s.model} · {s.dataset} · {', '.join(s.metrics)}").classes("text-xs am-muted truncate w-full")
+            if s.status == "running":
+                with ui.row().classes("items-center gap-2 w-full no-wrap"):
+                    ui.linear_progress(s.progress, show_value=False, size="6px").classes("grow rounded")
+                    ui.label(f"{s.trial}/{s.n_trials}").classes("text-xs am-mono am-muted")
 
-        if session.error_message:
-            details.append(ft.Text(f"Error: {session.error_message}", color=ft.colors.RED_600))
-        if session.last_heartbeat:
-            details.append(ft.Text(f"Last Heartbeat: {session.last_heartbeat}"))
+    # ------------------------------------------------------------------
+    # Session detail
+    # ------------------------------------------------------------------
 
-        loss_chart = self._create_loss_chart(session.session_id)
-        if loss_chart:
-            details.append(ft.Divider())
-            details.append(ft.Text("Training Curve", size=16, weight=ft.FontWeight.BOLD))
-            details.append(loss_chart)
+    def _render_detail(self):
+        s = self.selected
+        # Rebuild the whole dashboard only on selection/status change; live
+        # numbers, charts and logs are patched in place by _update_live().
+        sig = (s.session_id, s.status, s.test_true is not None) if s else None
+        if sig != self._detail_sig:
+            self._detail_sig = sig
+            self._live_sig = None
+            self._build_detail(s)
+        if s:
+            self._update_live(s)
 
-        if session.test_true is not None and session.test_pred is not None:
-            details.append(ft.Divider())
-            details.append(ft.Text("ROC Curve (best/final trial)", size=16, weight=ft.FontWeight.BOLD))
-            roc_chart = self._create_roc_chart(session.test_true, session.test_pred)
-            if roc_chart:
-                details.append(roc_chart)
+    def _build_detail(self, s: Optional[SessionInfo]):
+        self.detail_box.clear()
+        self.curve_chart = self.log_view = self.kpi_box = None
+        self._log_pos = 0
+        with self.detail_box:
+            if s is None:
+                with ui.card().props("flat").classes("am-card w-full items-center py-16 gap-3"):
+                    ui.icon("insights", size="48px").classes("text-primary")
+                    ui.label("No session selected").classes("text-lg font-semibold")
+                    ui.label("Launch a search from the New search tab, then follow it here.").classes("am-muted")
+                return
 
-        self.session_details.controls = details
-        _safe_update(self.session_details)
+            with ui.card().props("flat").classes("am-card w-full gap-3"):
+                with ui.row().classes("items-start w-full gap-3"):
+                    with ui.column().classes("gap-1 grow min-w-0"):
+                        with ui.row().classes("items-center gap-3"):
+                            ui.label(s.name).classes("text-xl font-semibold truncate")
+                            status_chip(s.status)
+                        ui.label(s.session_id).classes("text-xs am-mono am-muted")
+                    with ui.row().classes("gap-2"):
+                        if s.status == "running":
+                            ui.button("Cancel", icon="stop", color="warning", on_click=lambda: self._confirm_cancel(s)).props("unelevated no-caps")
+                        ui.button("Delete", icon="delete", color="negative", on_click=lambda: self._confirm_delete(s)).props("flat no-caps")
+                training = s.config.get("training", {})
+                with ui.row().classes("gap-2"):
+                    for icon, text in (
+                        ("hub", f"{s.backend} · {s.model}"),
+                        ("dataset", s.dataset),
+                        ("flag", ", ".join(s.metrics)),
+                        ("functions", f"{training.get('loss', '?')} + {training.get('optimizer', '?')}"),
+                        ("schedule", f"started {relative_time(s.start_time)}"),
+                    ):
+                        ui.chip(text, icon=icon, color="grey-7").props("outline dense")
+                if s.error_message:
+                    with ui.row().classes("w-full items-center gap-2 p-3 rounded-lg bg-red-500/10 no-wrap"):
+                        ui.icon("error", color="negative")
+                        ui.label(s.error_message).classes("text-negative text-sm am-mono break-all")
 
-    def _create_loss_chart(self, session_id: str):
-        """Live loss/metric line chart from the per-session epoch-history
-        JSONL file -- replaces the old GUI's wandb-only `update_chart()`,
-        since wandb isn't installed in this environment."""
-        history = self.session_manager.get_epoch_history(session_id, max_points=200)
-        if not history:
-            return None
+            self.kpi_box = ui.element("div").classes("w-full grid grid-cols-2 xl:grid-cols-5 gap-3")
+
+            with ui.card().props("flat").classes("am-card w-full gap-2 p-0"):
+                with ui.tabs(value=self.detail_tab, on_change=lambda e: setattr(self, "detail_tab", e.value)).props(
+                    "dense no-caps align=left active-color=primary indicator-color=primary"
+                ).classes("w-full px-3 pt-2") as tabs:
+                    ui.tab("curves", "Training curves", icon="show_chart")
+                    ui.tab("roc", "ROC", icon="area_chart")
+                    ui.tab("logs", "Logs", icon="terminal")
+                    ui.tab("config", "Config", icon="data_object")
+                with ui.tab_panels(tabs, value=self.detail_tab).props("animated").classes("w-full bg-transparent"):
+                    with ui.tab_panel("curves"):
+                        self.curve_box = ui.column().classes("w-full")
+                    with ui.tab_panel("roc"):
+                        if s.test_true is not None and s.test_pred is not None:
+                            try:
+                                options = _roc_options(s.test_true, s.test_pred)
+                            except Exception as exc:
+                                logger.error(f"Error creating ROC chart: {exc}")
+                                options = None
+                            if options:
+                                ui.echart(options).classes("w-full h-[420px]")
+                            else:
+                                self._empty_state("area_chart", "Could not compute an ROC curve from the saved predictions.")
+                        else:
+                            self._empty_state("area_chart", "The ROC curve appears once the first trial finishes.")
+                    with ui.tab_panel("logs"):
+                        with ui.row().classes("w-full justify-end"):
+                            ui.button("Copy path", icon="content_copy", on_click=lambda: ui.clipboard.write(s.log_file)).props("flat dense no-caps size=sm")
+                        self.log_view = ui.log(max_lines=3000).classes("w-full am-log am-mono")
+                    with ui.tab_panel("config"):
+                        ui.code(json.dumps(s.config, indent=2), language="json").classes("w-full text-xs")
+
+    @staticmethod
+    def _empty_state(icon: str, text: str):
+        with ui.column().classes("w-full items-center py-16 gap-2 am-muted"):
+            ui.icon(icon, size="40px")
+            ui.label(text)
+
+    def _update_live(self, s: SessionInfo):
+        history = self.session_manager.get_epoch_history(s.session_id, max_points=0)
+        log_size = Path(s.log_file).stat().st_size if s.log_file and os.path.exists(s.log_file) else 0
+        sig = (s.trial, s.current_epoch, round(s.progress, 4), s.loss, len(history), log_size, relative_time(s.start_time))
+        if sig == self._live_sig:
+            return
+        self._live_sig = sig
+
+        primary = s.metrics[0] if s.metrics else None
+        best = max((row[primary] for row in history if isinstance(row.get(primary), (int, float))), default=None) if primary else None
+        self.kpi_box.clear()
+        with self.kpi_box:
+            stat_tile("Progress", f"{s.progress:.0%}", "donut_large")
+            stat_tile("Trial", f"{s.trial}/{s.n_trials}", "science")
+            stat_tile("Epoch", f"{s.current_epoch}/{s.epochs}", "repeat")
+            stat_tile(f"Best {primary or 'metric'}", f"{best:.4f}" if best is not None else "-", "emoji_events", f"loss {s.loss:.4f}")
+            stat_tile("Elapsed", duration(s.start_time, s.end_time), "timer")
+
+        if history:
+            options = _curve_options(history, s.metrics)
+            if self.curve_chart is None:
+                self.curve_box.clear()
+                with self.curve_box:
+                    self.curve_chart = ui.echart(options).classes("w-full h-[420px]")
+            else:
+                self.curve_chart.options.clear()
+                self.curve_chart.options.update(options)
+                self.curve_chart.update()
+        elif self.curve_chart is None:
+            self.curve_box.clear()
+            with self.curve_box:
+                self._empty_state("show_chart", "Waiting for the first epoch to finish...")
+
+        self._tail_log(s.log_file, log_size)
+
+    def _tail_log(self, log_file: str, size: int):
+        if self.log_view is None or not log_file or size <= self._log_pos:
+            return
+        first_read = self._log_pos == 0
+        start = max(0, size - _LOG_TAIL_BYTES) if first_read else self._log_pos
         try:
-            keys = sorted({k for row in history for k in row if k != "epoch"})
-            series = []
-            legend_items = []
-            for i, key in enumerate(keys):
-                points = [ft.LineChartDataPoint(row["epoch"], row[key]) for row in history if key in row]
-                if not points:
-                    continue
-                color = _CHART_COLORS[i % len(_CHART_COLORS)]
-                series.append(ft.LineChartData(data_points=points, stroke_width=2, color=color, curved=True, stroke_cap_round=True))
-                legend_items.append(
-                    ft.Row([ft.Container(width=12, height=12, bgcolor=color, border_radius=3), ft.Text(key, size=11)], spacing=4)
-                )
-            if not series:
-                return None
-
-            max_epoch = max(row["epoch"] for row in history)
-            chart = ft.Container(
-                content=ft.LineChart(
-                    data_series=series,
-                    border=ft.border.all(1, ft.colors.GREY_400),
-                    left_axis=ft.ChartAxis(labels_size=30, title=ft.Text("value")),
-                    bottom_axis=ft.ChartAxis(labels_size=30, title=ft.Text("epoch")),
-                    tooltip_bgcolor=ft.colors.with_opacity(0.8, ft.colors.BLUE_GREY),
-                    min_x=1, max_x=max(max_epoch, 1),
-                    width=450, height=300,
-                ),
-            )
-            return ft.Column([ft.Row(legend_items, spacing=15), chart], spacing=5)
-        except Exception as e:
-            logger.error(f"Error creating loss chart for session {session_id}: {e}")
-            return ft.Text(f"Error creating training curve: {e}", color=ft.colors.RED_600)
-
-    def _create_roc_chart(self, test_true: List[float], test_pred: List[float]):
-        try:
-            test_true = np.asarray(test_true)
-            test_pred = np.asarray(test_pred)
-            if test_pred.min() < 0 or test_pred.max() > 1:
-                from scipy.special import expit
-                test_pred = expit(test_pred)
-            test_true = test_true.flatten()
-            test_pred = test_pred.flatten()
-
-            fpr, tpr, _ = roc_curve(test_true, test_pred)
-            data_points = [ft.LineChartDataPoint(x, y) for x, y in zip(fpr.tolist(), tpr.tolist())]
-            roc_data = ft.LineChartData(data_points=data_points, stroke_width=2, color=ft.colors.BLUE, curved=True, stroke_cap_round=True)
-
-            return ft.Container(
-                content=ft.LineChart(
-                    data_series=[roc_data],
-                    border=ft.border.all(1, ft.colors.GREY_400),
-                    left_axis=ft.ChartAxis(labels_size=30, title=ft.Text("TPR")),
-                    bottom_axis=ft.ChartAxis(labels_size=30, title=ft.Text("FPR")),
-                    tooltip_bgcolor=ft.colors.with_opacity(0.8, ft.colors.BLUE_GREY),
-                    min_x=0, max_x=1, min_y=0, max_y=1,
-                    width=450, height=400,
-                ),
-            )
-        except Exception as e:
-            logger.error(f"Error creating ROC chart: {e}")
-            return ft.Text(f"Error creating ROC curve: {e}", color=ft.colors.RED_600)
-
-    def _update_controls(self):
-        has_selection = self.selected_session is not None
-        is_running = has_selection and self.selected_session.status == "running"
-        buttons = self.controls_container.content.controls
-        for i, button in enumerate(buttons):
-            button.disabled = (not has_selection or not is_running) if i == 0 else not has_selection
-        _safe_update(self.controls_container)
+            with open(log_file, "rb") as f:
+                f.seek(start)
+                chunk = f.read(size - start)
+        except OSError as exc:
+            logger.error(f"Error reading log {log_file}: {exc}")
+            return
+        # Only consume complete lines; a partially written last line is
+        # picked up on the next tick.
+        end = chunk.rfind(b"\n") + 1
+        if end == 0:
+            return
+        self._log_pos = start + end
+        lines = chunk[:end].decode("utf-8", errors="replace").splitlines()
+        if first_read and start > 0:
+            lines = lines[1:]  # starts mid-line
+        if lines:
+            self.log_view.push("\n".join(lines))
 
     # ------------------------------------------------------------------
     # Actions
     # ------------------------------------------------------------------
 
-    def _cancel_session(self, e):
-        if self.selected_session and self.selected_session.status == "running":
-            session_id = self.selected_session.session_id
-            if self.session_manager.cancel_session(session_id):
-                logger.info(f"Cancelled session {session_id}")
-                self._load_sessions()
-            else:
-                logger.error(f"Failed to cancel session {session_id}")
+    async def _confirm(self, title: str, text: str, action: str, color: str) -> bool:
+        with ui.dialog() as dialog, ui.card().classes("p-5 gap-3 w-[420px] max-w-full"):
+            ui.label(title).classes("text-lg font-semibold")
+            ui.label(text).classes("text-sm am-muted")
+            with ui.row().classes("w-full justify-end gap-2"):
+                ui.button("Keep it", on_click=lambda: dialog.submit(False)).props("flat no-caps")
+                ui.button(action, color=color, on_click=lambda: dialog.submit(True)).props("unelevated no-caps")
+        return bool(await dialog)
 
-    def _refresh_sessions(self, e):
-        self.selected_session = None
-        self._load_sessions()
-
-    def _delete_session(self, e):
-        if self.selected_session:
-            session_id = self.selected_session.session_id
-            if self.session_manager.delete_session(session_id):
-                logger.info(f"Deleted session {session_id}")
-                self.selected_session = None
-                self._load_sessions()
-            else:
-                logger.error(f"Failed to delete session {session_id}")
-
-    def _view_logs(self, e):
-        if not self.selected_session:
+    async def _confirm_cancel(self, s: SessionInfo):
+        if not await self._confirm("Cancel this search?", "The worker process is terminated; finished trials are kept.", "Cancel search", "warning"):
             return
-        session = self.selected_session
-        logs = self.session_manager.get_session_logs(session.session_id, lines=1000)
-        if not logs:
-            logger.warning(f"No logs available for session {session.session_id}")
+        session = self.session_manager.get_session(s.session_id)
+        # The worker overwrites `pid` with its own once it's alive; until
+        # then it's still stamped with the GUI's own PID (see
+        # training_worker.run()) -- guard against terminating ourselves.
+        if session and session.pid == os.getpid():
+            ui.notify("Training is still initializing, try again in a few seconds", type="warning")
             return
-        log_dialog = ft.AlertDialog(
-            title=ft.Text(f"Logs for {session.name}"),
-            content=ft.Container(content=ft.Text("".join(logs), selectable=True, size=10), width=600, height=400),
-            actions=[ft.TextButton("Close", on_click=lambda e: self.page.close(log_dialog))],
-        )
-        self.page.dialog = log_dialog
-        log_dialog.open = True
-        self.page.update()
+        self.session_manager.cancel_session(s.session_id)
+        ui.notify("Session cancelled", type="warning")
+        self.refresh()
 
-    def _go_back(self, e):
-        self._stop_auto_refresh()
-        self.page.go("/")
-
-    # ------------------------------------------------------------------
-    # Auto-refresh (old GUI's monitor page required a manual click; this
-    # periodically reloads while any session is running)
-    # ------------------------------------------------------------------
-
-    def _start_auto_refresh(self):
-        self._auto_refresh_active = True
-        self._schedule_auto_refresh()
-
-    def _schedule_auto_refresh(self):
-        if not self._auto_refresh_active:
+    async def _confirm_delete(self, s: SessionInfo):
+        if not await self._confirm(
+            "Delete this session?",
+            "Removes its record, logs, checkpoints and AutoMAX state from disk. This cannot be undone.",
+            "Delete", "negative",
+        ):
             return
-        self._auto_refresh_timer = threading.Timer(4.0, self._auto_refresh_tick)
-        self._auto_refresh_timer.daemon = True
-        self._auto_refresh_timer.start()
-
-    def _auto_refresh_tick(self):
-        if not self._auto_refresh_active:
+        session = self.session_manager.get_session(s.session_id)
+        if session and session.status == "running" and session.pid == os.getpid():
+            ui.notify("Training is still initializing, try again in a few seconds", type="warning")
             return
-        try:
-            if any(s.status == "running" for s in self.session_manager.get_all_sessions()):
-                self._load_sessions()
-        except Exception as exc:
-            logger.error(f"Auto-refresh error: {exc}")
-        finally:
-            self._schedule_auto_refresh()
-
-    def _stop_auto_refresh(self):
-        self._auto_refresh_active = False
-        if self._auto_refresh_timer:
-            self._auto_refresh_timer.cancel()
-            self._auto_refresh_timer = None
-
-    def initialize(self):
-        """Initialize the monitor page after it's added to the page."""
-        self._load_sessions()
-        self._start_auto_refresh()
+        self.session_manager.delete_session(s.session_id)
+        ui.notify("Session deleted")
+        self.select(None)

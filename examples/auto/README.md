@@ -10,7 +10,7 @@ Full documentation: [AutoMAX Documentation](https://optimization-ai.github.io/Au
 
 ```bash
 pip install "libauc[auto]"          # search (SMAC3)
-pip install "libauc[auto,gui]"      # + desktop GUI (Flet)
+pip install "libauc[auto,gui]"      # + web GUI (NiceGUI)
 ```
 
 SMAC3 needs `swig` and a C++ compiler to build. With conda: `conda install gxx_linux-64 gcc_linux-64 swig`.
@@ -176,22 +176,27 @@ torchrun --nproc_per_node 4 -m libauc.trainer.run_image_trainer --config_file cf
 
 ## GUI
 
-AutoMAX also ships a desktop GUI (built with [Flet](https://flet.dev)) for configuring and launching a search without writing a YAML recipe by hand, plus a session manager for tracking, monitoring, and cancelling runs.
+AutoMAX also ships a browser-based GUI (built with [NiceGUI](https://nicegui.io)) for configuring and launching a search without writing a YAML recipe by hand, plus a session manager for tracking, monitoring, and cancelling runs.
 
 ```bash
-python -m libauc.auto.ui.gui_main
+python -m libauc.auto.ui.gui_main            # first free port from 8080; the URL is printed
+python -m libauc.auto.ui.gui_main --port 9000 --show
 ```
 
-The main window lets you:
+It binds to `127.0.0.1` by default. On a remote machine you're SSH'd into, forward the port (VS Code's Remote-SSH does this automatically; otherwise `ssh -L 8080:localhost:8080 <host>`) and open the printed URL locally.
+
+On a cluster where the GUI runs on a compute node but you're connected to a login node, start it with `--host 0.0.0.0`. It then prints a URL like `http://<node>:8080/?token=...`. Forward `<node>:8080` from the login node (in VS Code's **Ports** panel, *Forward a Port* accepts `host:port`), then open `http://localhost:<forwarded port>/?token=...`. Every request needs that random token, so other users on the cluster network can't use your GUI. Folder/file browse buttons list the *server's* filesystem, where your data lives.
+
+The **New search** tab lets you:
 
 - Pick a backend (Image Classification or Graph/GNN), a model, and a dataset from the supported choices — or select **HuggingFace Model...** from the model dropdown and type any HF Hub repo ID (e.g. `google/vit-base-patch16-224`) to load a custom model instead.
-- For predefined datasets, set a **Root Path** (type it or use the folder-browse button) pointing at your local copy of the chosen dataset — it starts blank on purpose, so loading fails with a clear message if it's not set; the path is remembered per dataset across restarts.
-- Select **Custom Dataset...** to load your own CSV-backed image dataset (image backend only): point **Dataset Root Path** (type it or browse) at a folder containing `train.csv` + `val.csv`/`valid.csv` (and optionally `test.csv`) — they're auto-detected by filename, no need to type each path — and set image/label column names. Image paths in the CSV are resolved relative to that same Root Path. Loaded via LibAUC's `MedicalImageCSVDataset`. Click **Save Custom Dataset** to register it under a name of your choice (must not collide with a predefined or already-added custom dataset name) so it can be reused later just by retyping that name. Custom graph datasets are not yet supported.
+- For predefined datasets, set a **Root Path** (type it or browse) pointing at your local copy of the chosen dataset — it starts blank on purpose, so loading fails with a clear message if it's not set; the path is remembered per dataset across restarts.
+- Select **Custom Dataset...** to load your own CSV-backed image dataset (image backend only): point **Dataset Root Path** (type it or browse) at a folder containing `train.csv` + `val.csv`/`valid.csv` (and optionally `test.csv`) — they're auto-detected by filename, no need to type each path — and set image/label column names. Image paths in the CSV are resolved relative to that same Root Path. Loaded via LibAUC's `MedicalImageCSVDataset`. Click **Save Custom Dataset** to register it under a name of your choice (must not collide with a predefined or already-added custom dataset name) so it shows up in the dataset list next time. Custom graph datasets are not yet supported.
 - Pick a target metric (AUROC/AUPRC/ACC, with optional partial-AUROC `max_fpr`/`min_tpr`) and a loss function — the paired optimizer and both hyperparameter search spaces are populated automatically.
 - Tune the search space per hyperparameter (continuous range with optional log scale, categorical choices, or a fixed value) and set training/search parameters (epochs, batch size, number of trials, etc.).
 - Start training, which runs in an independent subprocess — closing the GUI does not stop it.
 
-Click **Monitor Sessions** to see all past and running sessions, live training-curve/metric charts, an ROC curve for the best trial, per-session logs, and controls to cancel or delete a session.
+A run summary with a readiness checklist stays pinned beside the form. After launching, the app switches to the **Sessions** tab, which lists all past and running sessions and shows live progress, interactive training curves across trials, an ROC curve for the best trial, a streaming log tail, the exact config, and controls to cancel or delete a session. The GUI keeps nothing in memory, so you can close and reopen the page or restart the server at any time.
 
 Sessions, logs, and per-session outputs are stored under `gui_sessions/` (created on first run; not needed for the plain CLI workflow above). Remembered dataset root paths and saved custom datasets are stored in `gui_sessions/dataset_config.json`.
 

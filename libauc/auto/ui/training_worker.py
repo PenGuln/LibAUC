@@ -47,18 +47,19 @@ def run(cfg_dict: dict, session_id: str) -> None:
         session_callback_holder.append(callback)
         return [callback]
 
-    trainer, automax_args, metric_names = build_pipeline(cfg_dict, callback_factory=callback_factory)
-
-    tuner = SessionAwareAutoMAX(
-        trainer,
-        automax_args,
-        target=metric_names[0],
-        session_manager=session_manager,
-        session_id=session_id,
-        session_callback=session_callback_holder[0] if session_callback_holder else None,
-    )
-
+    # Setup (dataset loading, model building) is inside the try so its
+    # failures are recorded on the session too, not just in the log file.
     try:
+        trainer, automax_args, metric_names = build_pipeline(cfg_dict, callback_factory=callback_factory)
+
+        tuner = SessionAwareAutoMAX(
+            trainer,
+            automax_args,
+            target=metric_names[0],
+            session_manager=session_manager,
+            session_id=session_id,
+            session_callback=session_callback_holder[0] if session_callback_holder else None,
+        )
         tuner.optimize()
     except TrainingCancelled:
         session_manager.write_session_log(session_id, "Training cancelled by user")
