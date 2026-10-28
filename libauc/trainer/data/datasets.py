@@ -332,6 +332,11 @@ def load_dataset(name: str, splits: list, **kwargs):
     if name in _OGB_CLASS_IDS:
         return _load_ogbg(name, _OGB_CLASS_IDS[name], root_path, splits)
 
+    # ── Medical evaluation benchmarks (see benchmarks.py) ────────────────────
+    from .benchmarks import BENCHMARKS, load_benchmark_dataset
+    if name in BENCHMARKS:
+        return load_benchmark_dataset(name, splits, **{**kwargs, "root_path": root_path})
+
     # ── Image datasets ───────────────────────────────────────────────────────
     if name == "catvsdog":
         raise NotImplementedError(f"Dataset '{name}' is not yet implemented.")

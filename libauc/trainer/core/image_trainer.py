@@ -112,6 +112,39 @@ class _HFModelWrapper(torch.nn.Module):
         return self.hf_model(pixel_values=x).logits
 
 
+class _RADEOClassifier(torch.nn.Module):
+    """RADEO encoder (fixed ``modality`` / ``body_part`` conditioning) with a
+    linear head. ``tuning_mode: linear_probe`` freezes the encoder, as in the
+    Medicine_Foundation_Model ``lincls.py`` evaluations."""
+
+    def __init__(self, model_cfg: dict, num_classes: int) -> None:
+        super().__init__()
+        from libauc.models.mil_models import FoundationEncoder
+        try:
+            from libauc.models.radeo import load_radeo
+        except ImportError as exc:
+            raise ImportError("The 'radeo' model needs libauc/models/radeo.py, builder_vfm.py and tamevfm/, "
+                              "which are not part of this distribution.") from exc
+
+        path = model_cfg.get("pretrained_path")
+        if not path:
+            raise ValueError("RADEO requires 'pretrained_path' (the checkpoint folder)")
+        tuning_mode = model_cfg.get("tuning_mode", "linear_probe")
+        if tuning_mode not in ("linear_probe", "full_finetune"):
+            raise ValueError("tuning_mode must be 'linear_probe' or 'full_finetune'")
+        encoder, feature_dim = load_radeo(
+            path, config_path=model_cfg.get("config_path"),
+            modality=model_cfg.get("modality", "MRI"), body_part=model_cfg.get("body_part", "N/A"),
+        )
+        self.encoder = FoundationEncoder(encoder, frozen=tuning_mode == "linear_probe")
+        self.fc = torch.nn.Linear(feature_dim, num_classes)
+        logger.info(f"RADEO ({tuning_mode}): modality={model_cfg.get('modality', 'MRI')}, "
+                    f"body_part={model_cfg.get('body_part', 'N/A')}, features={feature_dim}")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fc(self.encoder(x))
+
+
 class Trainer:
     r"""
     Full training loop for image-classification models supported by libauc.
@@ -395,7 +428,8 @@ class Trainer:
 
     def _model_cfg_keys(self) -> Optional[set]:
         """Model-config keys :meth:`_build_model` understands (``None``: any key is accepted)."""
-        return {"name", "pretrained", "pretrained_remote", "pretrained_path"}
+        return {"name", "pretrained", "pretrained_remote", "pretrained_path",
+                "config_path", "modality", "body_part", "tuning_mode"}
 
     def _validate_model_cfg(self, model_cfg: dict):
         """Warn about unknown model-config keys (usually typos) and reject inconsistent init settings."""
@@ -493,6 +527,13 @@ class Trainer:
                           re-initialised so the model can be fine-tuned on a
                           different number of classes.
 
+        ``name: radeo`` builds the modality-conditioned RADEO ViT from the
+        Medicine_Foundation_Model checkpoint folder in ``pretrained_path``
+        (with its ``config.json``, or ``config_path``) plus a fresh linear
+        head, and takes ``modality`` / ``body_part`` (see
+        :mod:`libauc.models.radeo`) and ``tuning_mode`` (``linear_probe``,
+        the default, freezes the encoder; ``full_finetune`` trains it).
+
         Attributes set on ``self``
         --------------------------
         image_processor   ``AutoImageProcessor`` instance for the HF model
@@ -547,6 +588,10 @@ class Trainer:
         elif name_lower == "densenet121":
             from libauc.models import densenet121
             model = densenet121(pretrained=pretrained_remote, last_activation=None, activations='relu', num_classes=num_classes)
+        elif name_lower == "radeo":
+            model = _RADEOClassifier(model_cfg, num_classes)
+            # pretrained_path is the RADEO checkpoint, which _RADEOClassifier loads.
+            pretrained = False
         elif is_hf_model:
             from transformers import AutoImageProcessor, AutoModelForImageClassification
 
@@ -578,7 +623,7 @@ class Trainer:
         else:
             raise ValueError(
                 f"Unknown model '{name}'. Use a built-in name "
-                f"(resnet20, resnet18, densenet121) or a HuggingFace repo ID "
+                f"(resnet20, resnet18, densenet121, radeo) or a HuggingFace repo ID "
                 f"containing '/' (e.g. 'google/vit-base-patch16-224')."
             )
 

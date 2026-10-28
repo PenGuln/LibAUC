@@ -18,7 +18,9 @@ from typing import Callable, List, Optional
 import numpy as np
 from nicegui import run, ui
 
+import libauc
 from libauc.trainer import Trainer, load_dataset, parse_defaultconfig
+from libauc.trainer.data.benchmarks import BENCHMARKS, MEDMNIST_BENCHMARKS
 
 from ..custom_datasets import load_custom_csv_dataset
 from .dataset_config import get_dataset_config_store
@@ -35,6 +37,25 @@ logger = logging.getLogger(__name__)
 
 _IMAGE_MODELS = ["resnet18", "resnet20", "densenet121"]
 _IMAGE_DATASETS = ["cifar10", "pneumoniamnist", "breastmnist", "chestmnist", "melanoma", "ddsm", "chexpert"]
+
+# RADEO (Medicine_Foundation_Model encoder, see image_trainer's
+# _RADEOClassifier). Its code is kept out of the public distribution, so it's
+# offered only when libauc/models/radeo.py is present -- checked by path,
+# since importing libauc.models takes seconds. The modality / body-part lists
+# mirror libauc.models.radeo's MODALITY_95M and BODY_PARTS.
+_RADEO = "radeo"
+_RADEO_AVAILABLE = (Path(libauc.__file__).parent / "models" / "radeo.py").is_file()
+_RADEO_MODALITIES = ["X-Ray", "CT", "Microscopy", "Endoscopy", "Fundus", "Dermoscopy", "OCTA", "Ultrasound", "MRI", "OCT"]
+_RADEO_BODY_PARTS = ["Chest", "Abdomen", "Skin", "Eye", "N/A"]
+_RADEO_TUNING_MODES = {"linear_probe": "Linear probe", "full_finetune": "Fine-tune"}
+if _RADEO_AVAILABLE:
+    _IMAGE_MODELS.append(_RADEO)
+
+# Defaults suggested for paths not yet remembered in the dataset config
+# store, used only when they exist on this machine (the TAMU cluster).
+_RADEO_DEFAULT_CHECKPOINT = "/scratch/project/prj-02-medical-foundation-model/anant/weights/CH-4worker-mlp-dim256-RADEO60M-rho5/temp5-CHMLP"
+_BENCHMARK_CSV_ROOT = "/scratch/project/prj-02-medical-foundation-model/datasets/Evaluation_Datasets_Medical_Project"
+_BENCHMARK_MEDMNIST_ROOT = "/scratch/project/prj-02-medical-foundation-model/medMNIST2d"
 _GNN_MODELS = ["gcn", "gin", "gine", "graphsage", "gat", "mpnn", "deepergcn", "pna"]
 _GNN_DATASETS = ["ogbg-molhiv", "ogbg-moltox21", "ogbg-molmuv", "ogbg-molpcba"]
 
@@ -283,11 +304,29 @@ class ConfigurePanel:
                     _IMAGE_MODELS + [_HF_MODEL_OPTION], label="Architecture", on_change=self._model_changed,
                 ).props(FIELD).classes("w-56")
                 self.image_model_hf_id = ui.input("HuggingFace model ID", placeholder="google/vit-base-patch16-224").props(FIELD).classes("grow")
-                with ui.column().classes("gap-1 grow"):
+                with ui.column().classes("gap-1 grow") as self.pretrained_box:
                     self.pretrained_ck = ui.switch("Start from a checkpoint", on_change=self._model_changed)
                     with ui.row().classes("w-full items-center gap-1 no-wrap") as self.model_path_row:
                         self.model_path = ui.input("Checkpoint path").props(FIELD).classes("grow am-mono")
                         ui.button(icon="folder_open", on_click=lambda: self._browse(self.model_path, files=True)).props("flat round dense")
+
+            with ui.column().classes("w-full gap-3") as self.radeo_box:
+                with ui.row().classes("w-full items-center gap-1 no-wrap"):
+                    self.radeo_checkpoint = ui.input(
+                        "RADEO checkpoint folder (with config.json)",
+                        value=_RADEO_DEFAULT_CHECKPOINT if os.path.isdir(_RADEO_DEFAULT_CHECKPOINT) else "",
+                        on_change=self.refresh_summary,
+                    ).props(FIELD).classes("grow am-mono")
+                    ui.button(icon="folder_open", on_click=lambda: self._browse(self.radeo_checkpoint)).props("flat round dense")
+                with ui.row().classes("w-full items-center gap-3"):
+                    self.radeo_modality = ui.select(_RADEO_MODALITIES, label="Modality", value="MRI").props(FIELD).classes("w-40")
+                    self.radeo_body_part = ui.select(_RADEO_BODY_PARTS, label="Body part", value="N/A").props(FIELD).classes("w-36")
+                    self.radeo_tuning = ui.toggle(_RADEO_TUNING_MODES, value="linear_probe", on_change=self.refresh_summary).props(
+                        "no-caps unelevated toggle-color=primary"
+                    )
+                ui.label(
+                    "RADEO is conditioned on the image modality and body part; a benchmark dataset sets them for you."
+                ).classes("text-xs am-muted")
 
             with ui.row().classes("w-full items-start gap-3") as self.gnn_model_row:
                 self.gnn_model = ui.select(
@@ -431,6 +470,8 @@ class ConfigurePanel:
             names = _IMAGE_DATASETS
             saved = self.store.custom_image_dataset_names()
         options = {n: n for n in names}
+        if self.backend == "image":
+            options.update({n: f"{b['title']}  ·  {b['modality']}" for n, b in BENCHMARKS.items()})
         options.update({f"{_SAVED_CUSTOM_PREFIX}{n}": f"{n}  (custom)" for n in saved})
         options[_CUSTOM_DATASET_OPTION] = "+ New custom dataset..." if self.backend == "image" else _CUSTOM_DATASET_OPTION
         return options
@@ -439,6 +480,8 @@ class ConfigurePanel:
         issues = []
         if not self.model_name:
             issues.append("Choose a model")
+        elif self._is_radeo and not os.path.isfile(os.path.join(self.radeo_checkpoint.value.strip(), "config.json")):
+            issues.append("Set the RADEO checkpoint folder")
         if self._is_custom_gnn_dataset:
             issues.append("Custom graph datasets are not supported yet")
         elif not self.dataset_name:
@@ -457,7 +500,7 @@ class ConfigurePanel:
         epochs = int(self.epochs.value or 0)
         rows = [
             ("Task", "Graph" if self.backend == "gnn" else "Image"),
-            ("Model", self.model_name or "-"),
+            ("Model", f"radeo ({_RADEO_TUNING_MODES[self.radeo_tuning.value].lower()})" if self._is_radeo else self.model_name or "-"),
             ("Dataset", self.dataset_name or "-"),
             ("Target", self.metric.value + (" (partial)" if self._is_partial_auroc else "")),
             ("Loss", self.loss_select.value or "-"),
@@ -486,6 +529,10 @@ class ConfigurePanel:
         self.launch_btn.set_enabled(not issues)
 
     @property
+    def _is_radeo(self) -> bool:
+        return self.backend == "image" and self.image_model.value == _RADEO
+
+    @property
     def _is_partial_auroc(self) -> bool:
         return self.metric.value == "AUROC" and self.partial_auroc.value
 
@@ -507,6 +554,8 @@ class ConfigurePanel:
         self.image_model_hf_id.visible = self.image_model.value == _HF_MODEL_OPTION
         self.gnn_model_hf_id.visible = self.gnn_model.value == _HF_MODEL_OPTION
         self.model_path_row.visible = self.pretrained_ck.value
+        self.radeo_box.visible = self._is_radeo
+        self.pretrained_box.visible = not self._is_radeo
         self.refresh_summary()
 
     def _dataset_changed(self, *_):
@@ -527,7 +576,16 @@ class ConfigurePanel:
             self.custom_image_size.value = saved.get("image_size", 224)
         elif self.dataset_select.value and not is_custom_image and not self._is_custom_gnn_dataset:
             # Recall the last-used Root Path for this predefined dataset.
-            self.dataset_root_path.value = self.store.get_root_path(self.dataset_name)
+            root_path = self.store.get_root_path(self.dataset_name)
+            if not root_path and self.dataset_name in BENCHMARKS:
+                default = _BENCHMARK_MEDMNIST_ROOT if self.dataset_name in MEDMNIST_BENCHMARKS else _BENCHMARK_CSV_ROOT
+                root_path = default if os.path.isdir(default) else ""
+            self.dataset_root_path.value = root_path
+
+        benchmark = BENCHMARKS.get(self.dataset_name or "")
+        if benchmark:
+            self.radeo_modality.value = benchmark["modality"]
+            self.radeo_body_part.value = benchmark["body_part"]
         self._detect_custom_csvs()
 
     def _metric_changed(self, *_):
@@ -611,7 +669,7 @@ class ConfigurePanel:
             "image_size": int(self.custom_image_size.value or 224),
         }
         try:
-            self.store.add_custom_image_dataset(name, definition, reserved_names=_IMAGE_DATASETS)
+            self.store.add_custom_image_dataset(name, definition, reserved_names=_IMAGE_DATASETS + list(BENCHMARKS))
         except ValueError as exc:
             ui.notify(str(exc), type="negative")
             return
@@ -701,7 +759,10 @@ class ConfigurePanel:
         training = {
             "optimizer": optimizer["type"],
             "optimizer_kwargs": optimizer["space"],
-            "loss": loss["type"],
+            # The canonical name, not the resolved loss["type"] (e.g.
+            # MultiLabelAUCMLoss, pAUCLoss): build_pipeline() resolves the
+            # variant itself and only accepts canonical names.
+            "loss": self.loss_select.value,
             "loss_kwargs": loss["space"],
             "SEED": int(self.seed.value),
             "batch_size": int(self.batch_size.value),
@@ -725,6 +786,14 @@ class ConfigurePanel:
                 "num_tasks": 1,
                 "emb_dim": int(self.gnn_emb_dim.value),
                 "num_layers": int(self.gnn_num_layers.value),
+            }
+        elif self._is_radeo:
+            model = {
+                "name": _RADEO,
+                "pretrained_path": self.radeo_checkpoint.value.strip(),
+                "modality": self.radeo_modality.value,
+                "body_part": self.radeo_body_part.value,
+                "tuning_mode": self.radeo_tuning.value,
             }
         else:
             model = {"name": self.model_name, "pretrained": self.pretrained_ck.value}
