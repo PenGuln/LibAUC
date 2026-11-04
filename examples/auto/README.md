@@ -56,7 +56,7 @@ trainer:
   type: mil
   num_slices: 64               # slices sampled per study per step (may be a search spec)
 model:
-  name: resnet18               # resnet*, coatnet, radeo, biovfm, omnirad, imagenet_vit
+  name: resnet18               # resnet*, coatnet, radeo, omnirad, imagenet_vit
   pool: class_attention        # mean, max, (class_)attention, (class_)gated_attention, query_attention
 ```
 

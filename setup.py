@@ -40,7 +40,7 @@ setuptools.setup(
       'auto': ['smac>=2.3', 'ConfigSpace'],
       # libauc.auto.ui: web GUI (pip install libauc[auto,gui])
       'gui': ['nicegui>=3.0', 'psutil'],
-      # Study-level MIL backbones (RADEO / BioVFM / OmniRad / CoAtNet) and
+      # Study-level MIL backbones (RADEO / OmniRad / CoAtNet) and
       # DICOM preprocessing (pip install libauc[medical])
       'medical': ['timm', 'pydicom'],
   },

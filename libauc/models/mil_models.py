@@ -279,25 +279,6 @@ def build_mil_encoder(
     if tuning_mode not in {"linear_probe", "full_finetune"}:
         raise ValueError("tuning_mode must be 'linear_probe' or 'full_finetune'")
 
-    if name == "biovfm":
-        
-        if pretrained_path is None:
-            if cache_dir is None:
-                raise ValueError("BioVFM requires pretrained_path or cache_dir")
-            pretrained_path = os.path.join(
-                cache_dir, "BIOVFM", "pretrained_models", "biovfm_checkpoint.pth"
-            )
-
-        try:
-            from .biovfm import build_biovfm
-        except ImportError as exc:
-            raise ImportError("The 'biovfm' encoder needs libauc/models/biovfm.py and builder_vfm.py, "
-                              "which are not part of this distribution.") from exc
-
-        encoder = build_biovfm(pretrained_path)
-        frozen = tuning_mode == "linear_probe"
-        return FoundationEncoder(encoder, frozen=frozen), encoder.num_features
-
     if name == "radeo":
        
         if not pretrained or pretrained_path is None:

@@ -125,7 +125,7 @@ class MILTrainer(Trainer):
     concatenated series; evaluation scores every slice. The model is a
     :class:`~libauc.models.MILClassifier` over an encoder from
     :func:`~libauc.models.build_mil_encoder`, configured by ``model_cfg``:
-    ``name`` (``resnet18``, ``coatnet``, ``radeo``, ``biovfm``, ``omnirad``,
+    ``name`` (``resnet18``, ``coatnet``, ``radeo``, ``omnirad``,
     ``imagenet_vit``), ``pretrained``, ``pretrained_path``, ``config_path``,
     ``cache_dir``, ``tuning_mode`` (``full_finetune`` | ``linear_probe``),
     ``image_size``, ``modality``, ``body_part``, ``pool`` (``mean``, ``max``,
