@@ -306,8 +306,7 @@ def build_mil_encoder(
         try:
             from .radeo import load_radeo
         except ImportError as exc:
-            raise ImportError("The 'radeo' encoder needs libauc/models/radeo.py, builder_vfm.py and tamevfm/, "
-                              "which are not part of this distribution.") from exc
+            raise ImportError("The 'radeo' encoder needs the medical extras: pip install libauc[medical]") from exc
 
         encoder, feature_dim = load_radeo(
             pretrained_path,

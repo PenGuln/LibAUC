@@ -123,8 +123,7 @@ class _RADEOClassifier(torch.nn.Module):
         try:
             from libauc.models.radeo import load_radeo
         except ImportError as exc:
-            raise ImportError("The 'radeo' model needs libauc/models/radeo.py, builder_vfm.py and tamevfm/, "
-                              "which are not part of this distribution.") from exc
+            raise ImportError("The 'radeo' model needs the medical extras: pip install libauc[medical]") from exc
 
         path = model_cfg.get("pretrained_path")
         if not path:

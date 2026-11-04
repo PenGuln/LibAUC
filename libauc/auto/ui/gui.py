@@ -18,7 +18,6 @@ from typing import Callable, List, Optional
 import numpy as np
 from nicegui import run, ui
 
-import libauc
 from libauc.trainer import Trainer, load_dataset, parse_defaultconfig
 from libauc.trainer.data.benchmarks import BENCHMARKS, MEDMNIST_BENCHMARKS
 
@@ -44,17 +43,13 @@ _IMAGE_DATASETS = ["cifar10", "pneumoniamnist", "breastmnist", "chestmnist", "me
 _BENCHMARKS_ONLY = True
 
 # RADEO (Medicine_Foundation_Model encoder, see image_trainer's
-# _RADEOClassifier). Its code is kept out of the public distribution, so it's
-# offered only when libauc/models/radeo.py is present -- checked by path,
-# since importing libauc.models takes seconds. The modality list mirrors
-# libauc.models.radeo's MODALITY_95M. There's no body-part input: the
-# modality_vfm checkpoints ignore it.
+# _RADEOClassifier). The modality list mirrors libauc.models.radeo's
+# MODALITY_95M, since importing libauc.models takes seconds. There's no
+# body-part input: the modality_vfm checkpoints ignore it.
 _RADEO = "radeo"
-_RADEO_AVAILABLE = (Path(libauc.__file__).parent / "models" / "radeo.py").is_file()
 _RADEO_MODALITIES = ["X-Ray", "CT", "Microscopy", "Endoscopy", "Fundus", "Dermoscopy", "OCTA", "Ultrasound", "MRI", "OCT"]
 _RADEO_TUNING_MODES = {"linear_probe": "Linear probe", "full_finetune": "Fine-tune"}
-if _RADEO_AVAILABLE:
-    _IMAGE_MODELS.append(_RADEO)
+_IMAGE_MODELS.append(_RADEO)
 
 # Defaults suggested for paths not yet remembered in the dataset config
 # store, used only when they exist on this machine (the TAMU cluster).
