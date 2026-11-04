@@ -8,7 +8,7 @@ Remembers, across GUI restarts:
 
 This file is read/written only by GUI processes (``gui.py``). The actual
 training config handed to the worker subprocess is self-contained (see
-``AutoMAXApp._build_config()``), so the worker never needs to open this
+``ConfigurePanel._build_config()``), so the worker never needs to open this
 store -- it only exists for the GUI's own convenience/memory.
 """
 import json

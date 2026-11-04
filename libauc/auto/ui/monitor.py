@@ -265,6 +265,7 @@ class SessionsPanel:
                         ("flag", ", ".join(s.metrics)),
                         ("functions", f"{training.get('loss', '?')} + {training.get('optimizer', '?')}"),
                         ("schedule", f"started {relative_time(s.start_time)}"),
+                        ("dns", s.hostname or "unknown host"),
                     ):
                         ui.chip(text, icon=icon, color="grey-7").props("outline dense")
                 if s.error_message:
@@ -384,17 +385,21 @@ class SessionsPanel:
         return bool(await dialog)
 
     async def _confirm_cancel(self, s: SessionInfo):
-        if not await self._confirm("Cancel this search?", "The worker process is terminated; finished trials are kept.", "Cancel search", "warning"):
+        if not await self._confirm("Cancel this search?", "The worker stops; finished trials are kept.", "Cancel search", "warning"):
             return
         session = self.session_manager.get_session(s.session_id)
         # The worker overwrites `pid` with its own once it's alive; until
         # then it's still stamped with the GUI's own PID (see
         # training_worker.run()) -- guard against terminating ourselves.
-        if session and session.pid == os.getpid():
+        if session and self.session_manager.is_starting(session):
             ui.notify("Training is still initializing, try again in a few seconds", type="warning")
             return
-        self.session_manager.cancel_session(s.session_id)
-        ui.notify("Session cancelled", type="warning")
+        if not self.session_manager.cancel_session(s.session_id):
+            ui.notify("Could not cancel this session; see the GUI log for details", type="negative")
+        elif session and session.status == "running" and not self.session_manager.is_local(session):
+            ui.notify(f"Cancelled. The worker on {session.hostname or 'another host'} stops at its next training step", type="warning")
+        else:
+            ui.notify("Session cancelled", type="warning")
         self.refresh()
 
     async def _confirm_delete(self, s: SessionInfo):
@@ -405,9 +410,12 @@ class SessionsPanel:
         ):
             return
         session = self.session_manager.get_session(s.session_id)
-        if session and session.status == "running" and session.pid == os.getpid():
+        if session and session.status == "running" and self.session_manager.is_starting(session):
             ui.notify("Training is still initializing, try again in a few seconds", type="warning")
             return
-        self.session_manager.delete_session(s.session_id)
+        if not self.session_manager.delete_session(s.session_id):
+            ui.notify("Could not delete this session; see the GUI log for details", type="negative")
+            self.refresh()
+            return
         ui.notify("Session deleted")
         self.select(None)

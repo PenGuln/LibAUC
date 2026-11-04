@@ -52,7 +52,9 @@ class SessionCallback(TrainerCallback):
         return self._status_cache
 
     def _raise_if_cancelled(self):
-        if self._status() == "cancelled":
+        # No status means the session was deleted. A GUI on another host can't
+        # signal this process, so this is how such a delete stops it.
+        if self._status() in ("cancelled", None):
             raise TrainingCancelled(f"Session {self.session_id} was cancelled by the user")
 
     # ------------------------------------------------------------------

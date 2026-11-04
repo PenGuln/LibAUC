@@ -15,6 +15,7 @@ AutoAUC_demo session manager), so closing the GUI never kills training.
 import json
 import os
 import shutil
+import socket
 import threading
 import time
 import uuid
@@ -58,6 +59,7 @@ class SessionInfo:
     automax_output_directory: str = ""  # links to the real AutoMAX state.pkl root
     automax_name: str = ""
     pid: Optional[int] = None
+    hostname: Optional[str] = None  # host `pid` belongs to; None in older records
     last_heartbeat: Optional[str] = None
     error_message: Optional[str] = None
     test_true: Optional[List[float]] = None  # final epoch of the best/last trial only
@@ -69,6 +71,8 @@ class SessionManager:
 
     LOAD_ATTEMPTS = 5
     LOAD_RETRY_DELAY = 0.1  # seconds
+    HEARTBEAT_INTERVAL = 30  # seconds between a worker's heartbeats
+    HEARTBEAT_TIMEOUT = 300  # seconds of silence before a session counts as dead
 
     def __init__(
         self,
@@ -208,6 +212,7 @@ class SessionManager:
             automax_output_directory=automax_cfg.get("output_directory", ""),
             automax_name=automax_cfg.get("name", ""),
             pid=os.getpid(),
+            hostname=socket.gethostname(),
             last_heartbeat=current_time,
         )
 
@@ -252,8 +257,9 @@ class SessionManager:
 
     def cancel_session(self, session_id: str, terminate: bool = True) -> bool:
         """
-        Mark a running session as cancelled. Unless ``terminate`` is False,
-        also send its worker SIGTERM.
+        Mark a running session as cancelled and, unless ``terminate`` is False,
+        send its worker SIGTERM. A worker on another host can't be signalled;
+        it stops by itself when it next polls the status (see SessionCallback).
         """
         with self._transaction() as loaded:
             if not loaded or session_id not in self.sessions:
@@ -263,8 +269,9 @@ class SessionManager:
             if was_running:
                 session.status = "cancelled"
                 session.end_time = datetime.now().isoformat()
-                self._save_sessions()
-        if terminate and was_running and session.pid:
+                if not self._save_sessions():
+                    return False
+        if terminate and was_running and session.pid and self.is_local(session):
             try:
                 psutil.Process(session.pid).terminate()
                 logger.info(f"Terminated process {session.pid} for session {session_id}")
@@ -294,8 +301,8 @@ class SessionManager:
             return False
 
         session = self.sessions[session_id]
-        if session.status == "running":
-            self.cancel_session(session_id)
+        if session.status == "running" and not self.cancel_session(session_id):
+            return False
 
         for path_str in (session.log_file, str(self._history_file(session_id))):
             try:
@@ -329,11 +336,23 @@ class SessionManager:
     # Liveness monitoring
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def is_local(session: SessionInfo) -> bool:
+        """Whether ``session.pid`` refers to a process on this host."""
+        return session.hostname == socket.gethostname()
+
+    def is_starting(self, session: SessionInfo) -> bool:
+        """Whether ``session.pid`` is still this process's own, stamped by
+        create_session before the worker replaced it with its PID, so
+        cancelling now would terminate this process."""
+        return self.is_local(session) and session.pid == os.getpid()
+
     def _check_session_liveness(self, session: SessionInfo) -> bool:
         if session.status != "running":
             return True
 
-        if session.pid:
+        # A PID only means something on its own host; elsewhere the heartbeat decides.
+        if session.pid and self.is_local(session):
             try:
                 if not psutil.Process(session.pid).is_running():
                     logger.warning(f"Process {session.pid} for session {session.session_id} is not running")
@@ -345,7 +364,7 @@ class SessionManager:
         if session.last_heartbeat:
             try:
                 last_heartbeat = datetime.fromisoformat(session.last_heartbeat)
-                if datetime.now().timestamp() - last_heartbeat.timestamp() > 300:
+                if datetime.now().timestamp() - last_heartbeat.timestamp() > self.HEARTBEAT_TIMEOUT:
                     logger.warning(f"Session {session.session_id} heartbeat timeout")
                     return False
             except ValueError:
@@ -410,6 +429,24 @@ class SessionManager:
     def heartbeat(self, session_id: str):
         if self.update_session(session_id, last_heartbeat=datetime.now().isoformat()):
             logger.debug(f"Heartbeat for session {session_id}")
+
+    def start_heartbeat(self, session_id: str) -> threading.Event:
+        """
+        Send heartbeats from a background thread until the returned event is
+        set, so that a slow epoch or dataset load isn't mistaken for a dead
+        worker. For the worker process.
+        """
+        stop = threading.Event()
+
+        def beat():
+            while not stop.wait(self.HEARTBEAT_INTERVAL):
+                try:
+                    self.heartbeat(session_id)
+                except Exception as e:
+                    logger.error(f"Error sending heartbeat for session {session_id}: {e}")
+
+        threading.Thread(target=beat, daemon=True).start()
+        return stop
 
     # ------------------------------------------------------------------
     # Epoch history (for the monitor page's live loss/metric chart) --

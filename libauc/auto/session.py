@@ -68,7 +68,7 @@ class SessionAwareAutoMAX(AutoMAX):
     def train(self, space, seed: int = 0) -> float:
         trial_num = self.completed + 1
         session = self.session_manager.get_session(self.session_id)
-        if session is not None and session.status == "cancelled":
+        if session is None or session.status == "cancelled":
             raise TrainingCancelled(f"Cancelled before trial {trial_num} started")
 
         self.session_manager.write_session_log(
