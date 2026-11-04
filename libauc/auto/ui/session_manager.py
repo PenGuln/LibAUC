@@ -18,14 +18,17 @@ import shutil
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 import psutil
 
 import logging
+
+from .file_utils import atomic_write_json, file_lock
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +67,9 @@ class SessionInfo:
 class SessionManager:
     """Manages AutoMAX GUI sessions with JSON persistence and liveness monitoring."""
 
+    LOAD_ATTEMPTS = 5
+    LOAD_RETRY_DELAY = 0.1  # seconds
+
     def __init__(
         self,
         sessions_file: str = "gui_sessions/sessions.json",
@@ -99,29 +105,55 @@ class SessionManager:
     # Persistence
     # ------------------------------------------------------------------
 
-    def _load_sessions(self):
-        if not self.sessions_file.exists():
-            return
-        try:
-            with open(self.sessions_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            with self._lock:
-                self.sessions.clear()
-                for session_data in data["sessions"]:
-                    session = SessionInfo(**session_data)
-                    self.sessions[session.session_id] = session
-        except Exception as e:
-            logger.error(f"Error loading sessions: {e}")
+    def _load_sessions(self) -> bool:
+        """
+        Refresh ``self.sessions`` from disk. On failure, logs the error, keeps
+        the last good state and returns False, so that state must not be saved.
+        """
+        # Writes are atomic, so an unparseable file should only be seen from a
+        # worker still running older code, which rewrites the file in place.
+        # Such a read clears up within a moment, so retry before giving up.
+        for attempt in range(self.LOAD_ATTEMPTS):
+            try:
+                with self._lock:
+                    if not self.sessions_file.exists():
+                        self.sessions = {}
+                        return True
+                    with open(self.sessions_file, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    sessions = (SessionInfo(**session_data) for session_data in data["sessions"])
+                    self.sessions = {s.session_id: s for s in sessions}
+                return True
+            except json.JSONDecodeError as e:
+                error = e
+                if attempt < self.LOAD_ATTEMPTS - 1:
+                    time.sleep(self.LOAD_RETRY_DELAY)
+            except Exception as e:
+                error = e
+                break
+        logger.error(f"Error loading sessions: {error}")
+        return False
 
-    def _save_sessions(self):
+    def _save_sessions(self) -> bool:
         try:
             with self._lock:
                 sessions_data = {"sessions": [asdict(s) for s in self.sessions.values()]}
-            with open(self.sessions_file, "w", encoding="utf-8") as f:
-                json.dump(sessions_data, f, indent=2)
+                atomic_write_json(self.sessions_file, sessions_data)
             logger.debug(f"Saved {len(self.sessions)} sessions to {self.sessions_file}")
+            return True
         except Exception as e:
             logger.error(f"Error saving sessions: {e}")
+            return False
+
+    @contextmanager
+    def _transaction(self) -> Iterator[bool]:
+        """
+        Hold the locks for one load-change-save cycle and yield whether the
+        load succeeded. If it didn't, callers must not change or save anything.
+        Not reentrant across a nested ``_transaction``.
+        """
+        with self._lock, file_lock(self.sessions_file):
+            yield self._load_sessions()
 
     # ------------------------------------------------------------------
     # Session config helpers
@@ -183,55 +215,61 @@ class SessionManager:
             if hasattr(session, key):
                 setattr(session, key, value)
 
-        self._load_sessions()
-        with self._lock:
+        with self._transaction() as loaded:
+            if not loaded:
+                raise RuntimeError(f"Could not read {self.sessions_file}; not creating a session")
             self.sessions[session_id] = session
-        self._save_sessions()
+            if not self._save_sessions():
+                raise RuntimeError(f"Could not write {self.sessions_file}; not creating a session")
 
         logger.info(f"Created session {session_id}: {name}")
         return session
 
     def update_session(self, session_id: str, **kwargs) -> bool:
-        self._load_sessions()
-        with self._lock:
-            if session_id not in self.sessions:
+        with self._transaction() as loaded:
+            if not loaded or session_id not in self.sessions:
                 return False
             session = self.sessions[session_id]
             for key, value in kwargs.items():
                 if hasattr(session, key):
                     setattr(session, key, value)
             session.last_heartbeat = datetime.now().isoformat()
-        self._save_sessions()
-        return True
+            return self._save_sessions()
 
     def complete_session(self, session_id: str, error_message: Optional[str] = None) -> bool:
-        self._load_sessions()
-        if session_id not in self.sessions:
-            return False
-        session = self.sessions[session_id]
-        session.status = "failed" if error_message else "completed"
-        session.end_time = datetime.now().isoformat()
-        if error_message:
-            session.error_message = error_message
-        self._save_sessions()
+        with self._transaction() as loaded:
+            if not loaded or session_id not in self.sessions:
+                return False
+            session = self.sessions[session_id]
+            session.status = "failed" if error_message else "completed"
+            session.end_time = datetime.now().isoformat()
+            if error_message:
+                session.error_message = error_message
+            if not self._save_sessions():
+                return False
         logger.info(f"Session {session_id} {session.status}")
         return True
 
-    def cancel_session(self, session_id: str) -> bool:
-        self._load_sessions()
-        if session_id not in self.sessions:
-            return False
-        session = self.sessions[session_id]
-        if session.status == "running":
-            session.status = "cancelled"
-            session.end_time = datetime.now().isoformat()
-            self._save_sessions()
-            if session.pid:
-                try:
-                    psutil.Process(session.pid).terminate()
-                    logger.info(f"Terminated process {session.pid} for session {session_id}")
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    logger.warning(f"Could not terminate process {session.pid} for session {session_id}")
+    def cancel_session(self, session_id: str, terminate: bool = True) -> bool:
+        """
+        Mark a running session as cancelled. Unless ``terminate`` is False,
+        also send its worker SIGTERM.
+        """
+        with self._transaction() as loaded:
+            if not loaded or session_id not in self.sessions:
+                return False
+            session = self.sessions[session_id]
+            was_running = session.status == "running"
+            if was_running:
+                session.status = "cancelled"
+                session.end_time = datetime.now().isoformat()
+                self._save_sessions()
+        if terminate and was_running and session.pid:
+            try:
+                psutil.Process(session.pid).terminate()
+                logger.info(f"Terminated process {session.pid} for session {session_id}")
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                logger.warning(f"Could not terminate process {session.pid} for session {session_id}")
         logger.info(f"Cancelled session {session_id}")
         return True
 
@@ -252,8 +290,7 @@ class SessionManager:
 
     def delete_session(self, session_id: str) -> bool:
         """Delete a session: registry entry, log/history files, and its checkpoint dir."""
-        self._load_sessions()
-        if session_id not in self.sessions:
+        if not self._load_sessions() or session_id not in self.sessions:
             return False
 
         session = self.sessions[session_id]
@@ -278,9 +315,12 @@ class SessionManager:
         if automax_dir.exists():
             shutil.rmtree(automax_dir, ignore_errors=True)
 
-        with self._lock:
-            del self.sessions[session_id]
-        self._save_sessions()
+        with self._transaction() as loaded:
+            if not loaded:
+                return False
+            self.sessions.pop(session_id, None)
+            if not self._save_sessions():
+                return False
 
         logger.info(f"Deleted session {session_id}")
         return True

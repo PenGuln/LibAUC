@@ -842,7 +842,11 @@ class ConfigurePanel:
             self.store.set_root_path(self.dataset_name, self.dataset_root_path.value.strip())
 
         session_name = f"{self.model_name}_{self.loss_select.value}_{self.dataset_name}"
-        session = self.session_manager.create_session(session_name, config, backend=self.backend)
+        try:
+            session = self.session_manager.create_session(session_name, config, backend=self.backend)
+        except RuntimeError as exc:
+            ui.notify(str(exc), type="negative")
+            return
         try:
             process = self._start_training_process(session.session_id, session.log_file, config)
         except Exception as exc:
@@ -861,6 +865,9 @@ class ConfigurePanel:
                 [sys.executable, "-m", "libauc.auto.ui.training_worker", "--config", str(config_file), "--session-id", session_id],
                 # Same cwd as the GUI: gui_sessions/ paths are relative.
                 cwd=os.getcwd(),
+                # Detach from the GUI's terminal, so Ctrl-C or closing it
+                # stops the GUI but not training.
+                start_new_session=True,
                 stdout=log_fh,
                 stderr=subprocess.STDOUT,
             )

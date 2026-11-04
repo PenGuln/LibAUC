@@ -6,7 +6,7 @@ Remembers, across GUI restarts:
   * user-defined custom (CSV-backed) image datasets, so a name typed once
     can be reused later without re-entering all its fields.
 
-This file is read/written only by the GUI process (``gui.py``). The actual
+This file is read/written only by GUI processes (``gui.py``). The actual
 training config handed to the worker subprocess is self-contained (see
 ``AutoMAXApp._build_config()``), so the worker never needs to open this
 store -- it only exists for the GUI's own convenience/memory.
@@ -14,8 +14,11 @@ store -- it only exists for the GUI's own convenience/memory.
 import json
 import logging
 import threading
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, Iterator, List, Optional
+
+from .file_utils import atomic_write_json, file_lock
 
 logger = logging.getLogger(__name__)
 
@@ -31,26 +34,43 @@ class DatasetConfigStore:
     # Persistence
     # ------------------------------------------------------------------
 
-    def _load(self) -> Dict[str, Any]:
+    def _read(self) -> Dict[str, Any]:
+        """Read the store from disk. Raises if the file can't be read or parsed."""
         if not self.path.exists():
             return {"root_paths": {}, "custom_image_datasets": {}}
-        try:
-            with open(self.path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception as e:
-            logger.error(f"Error loading dataset config from {self.path}: {e}")
-            return {"root_paths": {}, "custom_image_datasets": {}}
+        with open(self.path, "r", encoding="utf-8") as f:
+            data = json.load(f)
         data.setdefault("root_paths", {})
         data.setdefault("custom_image_datasets", {})
         return data
 
+    def _load(self) -> Dict[str, Any]:
+        """Read the store for display, treating an unreadable file as empty."""
+        try:
+            return self._read()
+        except Exception as e:
+            logger.error(f"Error loading dataset config from {self.path}: {e}")
+            return {"root_paths": {}, "custom_image_datasets": {}}
+
     def _save(self, data: Dict[str, Any]) -> None:
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
+            atomic_write_json(self.path, data)
         except Exception as e:
             logger.error(f"Error saving dataset config to {self.path}: {e}")
+
+    @contextmanager
+    def _transaction(self) -> Iterator[Dict[str, Any]]:
+        """Hold the locks for one load-change-save cycle, yielding the store's
+        contents. Raises ValueError if they can't be read, so a bad file isn't
+        overwritten."""
+        with self._lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with file_lock(self.path):
+                try:
+                    data = self._read()
+                except Exception as e:
+                    raise ValueError(f"Could not read {self.path}: {e}") from e
+                yield data
 
     # ------------------------------------------------------------------
     # Root paths (predefined datasets)
@@ -63,11 +83,14 @@ class DatasetConfigStore:
     def set_root_path(self, dataset_name: str, root_path: str) -> None:
         if not dataset_name or not root_path:
             return
-        with self._lock:
-            data = self._load()
-            if data["root_paths"].get(dataset_name) != root_path:
-                data["root_paths"][dataset_name] = root_path
-                self._save(data)
+        try:
+            with self._transaction() as data:
+                if data["root_paths"].get(dataset_name) != root_path:
+                    data["root_paths"][dataset_name] = root_path
+                    self._save(data)
+        except ValueError as e:
+            # Only a convenience; not worth interrupting the GUI over.
+            logger.error(f"Not remembering root path for {dataset_name}: {e}")
 
     # ------------------------------------------------------------------
     # Custom (CSV-backed) image datasets
@@ -100,8 +123,7 @@ class DatasetConfigStore:
         if lname in {n.lower() for n in reserved_names}:
             raise ValueError(f"'{name}' is already a predefined dataset name.")
 
-        with self._lock:
-            data = self._load()
+        with self._transaction() as data:
             if lname in {n.lower() for n in data["custom_image_datasets"]}:
                 raise ValueError(f"A custom dataset named '{name}' has already been added.")
             data["custom_image_datasets"][name] = definition
