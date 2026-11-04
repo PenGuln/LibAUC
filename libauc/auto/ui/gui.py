@@ -872,4 +872,5 @@ class ConfigurePanel:
                 stderr=subprocess.STDOUT,
             )
         _worker_processes.append(process)
+        self.session_manager.record_worker(session_id, process.pid)
         return process

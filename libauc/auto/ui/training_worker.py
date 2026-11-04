@@ -13,7 +13,6 @@ import json
 import logging
 import os
 import signal
-import socket
 
 from .. import run_auto_gnn as auto_gnn, run_auto_trainer as auto_trainer
 from ..session import SessionAwareAutoMAX, TrainingCancelled
@@ -48,12 +47,9 @@ def run(cfg_dict: dict, session_id: str) -> None:
     # Setup (dataset loading, model building) is inside the try so its
     # failures are recorded on the session too, not just in the log file.
     try:
-        # Overwrite the PID stamped by the GUI process at session-creation time
-        # with this worker's own PID, so cancel_session() terminates the right
-        # process. There's a brief window before this line runs during which the
-        # session's `pid` is still the GUI's own PID -- the GUI's cancel handler
-        # guards against terminating itself during that window (see monitor.py).
-        session_manager.update_session(session_id, pid=os.getpid(), hostname=socket.gethostname())
+        # The GUI records this right after launching the worker; do it here too
+        # in case that update failed or something else launched this process.
+        session_manager.record_worker(session_id, os.getpid())
 
         trainer, automax_args, metric_names = build_pipeline(cfg_dict, callback_factory=callback_factory)
 

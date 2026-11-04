@@ -388,12 +388,6 @@ class SessionsPanel:
         if not await self._confirm("Cancel this search?", "The worker stops; finished trials are kept.", "Cancel search", "warning"):
             return
         session = self.session_manager.get_session(s.session_id)
-        # The worker overwrites `pid` with its own once it's alive; until
-        # then it's still stamped with the GUI's own PID (see
-        # training_worker.run()) -- guard against terminating ourselves.
-        if session and self.session_manager.is_starting(session):
-            ui.notify("Training is still initializing, try again in a few seconds", type="warning")
-            return
         if not self.session_manager.cancel_session(s.session_id):
             ui.notify("Could not cancel this session; see the GUI log for details", type="negative")
         elif session and session.status == "running" and not self.session_manager.is_local(session):
@@ -408,10 +402,6 @@ class SessionsPanel:
             "Removes its record, logs, checkpoints and AutoMAX state from disk. This cannot be undone.",
             "Delete", "negative",
         ):
-            return
-        session = self.session_manager.get_session(s.session_id)
-        if session and session.status == "running" and self.session_manager.is_starting(session):
-            ui.notify("Training is still initializing, try again in a few seconds", type="warning")
             return
         if not self.session_manager.delete_session(s.session_id):
             ui.notify("Could not delete this session; see the GUI log for details", type="negative")

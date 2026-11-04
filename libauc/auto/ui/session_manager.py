@@ -13,7 +13,6 @@ AutoAUC_demo session manager), so closing the GUI never kills training.
 """
 
 import json
-import os
 import shutil
 import socket
 import threading
@@ -58,8 +57,9 @@ class SessionInfo:
     output_path: str = ""  # training.output_path used for this session
     automax_output_directory: str = ""  # links to the real AutoMAX state.pkl root
     automax_name: str = ""
-    pid: Optional[int] = None
+    pid: Optional[int] = None  # the worker's; None until it has been launched
     hostname: Optional[str] = None  # host `pid` belongs to; None in older records
+    pid_create_time: Optional[float] = None  # tells the worker from a later process reusing `pid`
     last_heartbeat: Optional[str] = None
     error_message: Optional[str] = None
     test_true: Optional[List[float]] = None  # final epoch of the best/last trial only
@@ -73,6 +73,9 @@ class SessionManager:
     LOAD_RETRY_DELAY = 0.1  # seconds
     HEARTBEAT_INTERVAL = 30  # seconds between a worker's heartbeats
     HEARTBEAT_TIMEOUT = 300  # seconds of silence before a session counts as dead
+    # psutil derives start times from the boot time, which can read differently
+    # between processes. A reused PID started far later than this.
+    CREATE_TIME_TOLERANCE = 2.0  # seconds
 
     def __init__(
         self,
@@ -211,7 +214,6 @@ class SessionManager:
             output_path=training_cfg.get("output_path", ""),
             automax_output_directory=automax_cfg.get("output_directory", ""),
             automax_name=automax_cfg.get("name", ""),
-            pid=os.getpid(),
             hostname=socket.gethostname(),
             last_heartbeat=current_time,
         )
@@ -240,6 +242,14 @@ class SessionManager:
                     setattr(session, key, value)
             session.last_heartbeat = datetime.now().isoformat()
             return self._save_sessions()
+
+    def record_worker(self, session_id: str, pid: int) -> bool:
+        """Record the process running a session, which is on this host."""
+        try:
+            create_time = psutil.Process(pid).create_time()
+        except psutil.NoSuchProcess:
+            create_time = None
+        return self.update_session(session_id, pid=pid, hostname=socket.gethostname(), pid_create_time=create_time)
 
     def complete_session(self, session_id: str, error_message: Optional[str] = None) -> bool:
         with self._transaction() as loaded:
@@ -271,9 +281,10 @@ class SessionManager:
                 session.end_time = datetime.now().isoformat()
                 if not self._save_sessions():
                     return False
-        if terminate and was_running and session.pid and self.is_local(session):
+        process = self._worker_process(session) if terminate and was_running else None
+        if process is not None:
             try:
-                psutil.Process(session.pid).terminate()
+                process.terminate()
                 logger.info(f"Terminated process {session.pid} for session {session_id}")
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 logger.warning(f"Could not terminate process {session.pid} for session {session_id}")
@@ -341,25 +352,29 @@ class SessionManager:
         """Whether ``session.pid`` refers to a process on this host."""
         return session.hostname == socket.gethostname()
 
-    def is_starting(self, session: SessionInfo) -> bool:
-        """Whether ``session.pid`` is still this process's own, stamped by
-        create_session before the worker replaced it with its PID, so
-        cancelling now would terminate this process."""
-        return self.is_local(session) and session.pid == os.getpid()
+    def _worker_process(self, session: SessionInfo) -> Optional[psutil.Process]:
+        """The session's worker if it's still running on this host, else None,
+        including when another process has since been given its PID."""
+        if not session.pid or not self.is_local(session):
+            return None
+        try:
+            process = psutil.Process(session.pid)
+            # Records from before pid_create_time was added can only go by the PID.
+            if (session.pid_create_time is not None
+                    and abs(process.create_time() - session.pid_create_time) > self.CREATE_TIME_TOLERANCE):
+                return None
+        except psutil.NoSuchProcess:
+            return None
+        return process
 
     def _check_session_liveness(self, session: SessionInfo) -> bool:
         if session.status != "running":
             return True
 
         # A PID only means something on its own host; elsewhere the heartbeat decides.
-        if session.pid and self.is_local(session):
-            try:
-                if not psutil.Process(session.pid).is_running():
-                    logger.warning(f"Process {session.pid} for session {session.session_id} is not running")
-                    return False
-            except psutil.NoSuchProcess:
-                logger.warning(f"Process {session.pid} for session {session.session_id} not found")
-                return False
+        if session.pid and self.is_local(session) and self._worker_process(session) is None:
+            logger.warning(f"Process {session.pid} for session {session.session_id} is not running")
+            return False
 
         if session.last_heartbeat:
             try:
