@@ -43,6 +43,11 @@ def index():
     apply_theme()
     dark = ui.dark_mode(None)  # follow the OS until toggled
 
+    async def toggle_dark():
+        # Not dark.toggle(): it raises while following the OS, since only the
+        # browser knows which theme that resolved to.
+        dark.value = not await ui.run_javascript("document.body.classList.contains('body--dark')")
+
     with ui.header().classes("am-header items-center px-4 md:px-8 py-2 gap-4"):
         with ui.row().classes("items-center gap-3 no-wrap"):
             with ui.element("div").classes("am-brand"):
@@ -56,7 +61,7 @@ def index():
             with ui.tab("sessions", "Sessions", icon="monitor_heart"):
                 running_badge = ui.badge("", color="pink-5").props("floating rounded")
         ui.space()
-        ui.button(icon="dark_mode", on_click=dark.toggle).props("flat round color=white").tooltip("Toggle dark mode")
+        ui.button(icon="dark_mode", on_click=toggle_dark).props("flat round color=white").tooltip("Toggle dark mode")
 
     def on_launched(session_id: str):
         sessions.select(session_id)
