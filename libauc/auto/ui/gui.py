@@ -38,15 +38,20 @@ logger = logging.getLogger(__name__)
 _IMAGE_MODELS = ["resnet18", "resnet20", "densenet121"]
 _IMAGE_DATASETS = ["cifar10", "pneumoniamnist", "breastmnist", "chestmnist", "melanoma", "ddsm", "chexpert"]
 
+# Offer only the medical evaluation benchmarks (libauc.trainer.data.benchmarks),
+# hiding the datasets above, custom datasets and the graph backend, which has
+# no benchmarks. Set to False to bring them back.
+_BENCHMARKS_ONLY = True
+
 # RADEO (Medicine_Foundation_Model encoder, see image_trainer's
 # _RADEOClassifier). Its code is kept out of the public distribution, so it's
 # offered only when libauc/models/radeo.py is present -- checked by path,
-# since importing libauc.models takes seconds. The modality / body-part lists
-# mirror libauc.models.radeo's MODALITY_95M and BODY_PARTS.
+# since importing libauc.models takes seconds. The modality list mirrors
+# libauc.models.radeo's MODALITY_95M. There's no body-part input: the
+# modality_vfm checkpoints ignore it.
 _RADEO = "radeo"
 _RADEO_AVAILABLE = (Path(libauc.__file__).parent / "models" / "radeo.py").is_file()
 _RADEO_MODALITIES = ["X-Ray", "CT", "Microscopy", "Endoscopy", "Fundus", "Dermoscopy", "OCTA", "Ultrasound", "MRI", "OCT"]
-_RADEO_BODY_PARTS = ["Chest", "Abdomen", "Skin", "Eye", "N/A"]
 _RADEO_TUNING_MODES = {"linear_probe": "Linear probe", "full_finetune": "Fine-tune"}
 if _RADEO_AVAILABLE:
     _IMAGE_MODELS.append(_RADEO)
@@ -298,6 +303,7 @@ class ConfigurePanel:
                 {"image": "Image classification", "gnn": "Graph classification"}, value="image",
                 on_change=self._backend_changed,
             ).props("no-caps unelevated spread toggle-color=primary").classes("w-full")
+            self.backend_toggle.visible = not _BENCHMARKS_ONLY
 
             with ui.row().classes("w-full items-start gap-3") as self.image_model_row:
                 self.image_model = ui.select(
@@ -320,12 +326,11 @@ class ConfigurePanel:
                     ui.button(icon="folder_open", on_click=lambda: self._browse(self.radeo_checkpoint)).props("flat round dense")
                 with ui.row().classes("w-full items-center gap-3"):
                     self.radeo_modality = ui.select(_RADEO_MODALITIES, label="Modality", value="MRI").props(FIELD).classes("w-40")
-                    self.radeo_body_part = ui.select(_RADEO_BODY_PARTS, label="Body part", value="N/A").props(FIELD).classes("w-36")
                     self.radeo_tuning = ui.toggle(_RADEO_TUNING_MODES, value="linear_probe", on_change=self.refresh_summary).props(
                         "no-caps unelevated toggle-color=primary"
                     )
                 ui.label(
-                    "RADEO is conditioned on the image modality and body part; a benchmark dataset sets them for you."
+                    "RADEO is conditioned on the image modality; a benchmark dataset sets it for you."
                 ).classes("text-xs am-muted")
 
             with ui.row().classes("w-full items-start gap-3") as self.gnn_model_row:
@@ -338,7 +343,8 @@ class ConfigurePanel:
                 self.gnn_decay_factor = ui.number("Decay factor", value=10.0, min=0).props(FIELD).classes("w-32")
 
     def _build_dataset_card(self):
-        with section_card("Dataset", "dataset", "A built-in benchmark or your own CSV-indexed images"):
+        subtitle = "A medical evaluation benchmark" if _BENCHMARKS_ONLY else "A built-in benchmark or your own CSV-indexed images"
+        with section_card("Dataset", "dataset", subtitle):
             with ui.row().classes("w-full items-start gap-3"):
                 self.dataset_select = ui.select({}, label="Dataset", on_change=self._dataset_changed).props(FIELD).classes("w-64")
                 # Predefined datasets: Root Path starts blank on purpose -- a
@@ -463,6 +469,9 @@ class ConfigurePanel:
         return value
 
     def _dataset_options(self) -> dict:
+        benchmarks = {n: f"{b['title']}  ·  {b['modality']}" for n, b in BENCHMARKS.items()}
+        if _BENCHMARKS_ONLY:
+            return benchmarks
         if self.backend == "gnn":
             names = _GNN_DATASETS
             saved = []
@@ -471,7 +480,7 @@ class ConfigurePanel:
             saved = self.store.custom_image_dataset_names()
         options = {n: n for n in names}
         if self.backend == "image":
-            options.update({n: f"{b['title']}  ·  {b['modality']}" for n, b in BENCHMARKS.items()})
+            options.update(benchmarks)
         options.update({f"{_SAVED_CUSTOM_PREFIX}{n}": f"{n}  (custom)" for n in saved})
         options[_CUSTOM_DATASET_OPTION] = "+ New custom dataset..." if self.backend == "image" else _CUSTOM_DATASET_OPTION
         return options
@@ -585,7 +594,6 @@ class ConfigurePanel:
         benchmark = BENCHMARKS.get(self.dataset_name or "")
         if benchmark:
             self.radeo_modality.value = benchmark["modality"]
-            self.radeo_body_part.value = benchmark["body_part"]
         self._detect_custom_csvs()
 
     def _metric_changed(self, *_):
@@ -792,7 +800,6 @@ class ConfigurePanel:
                 "name": _RADEO,
                 "pretrained_path": self.radeo_checkpoint.value.strip(),
                 "modality": self.radeo_modality.value,
-                "body_part": self.radeo_body_part.value,
                 "tuning_mode": self.radeo_tuning.value,
             }
         else:
