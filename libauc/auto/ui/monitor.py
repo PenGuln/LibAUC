@@ -36,6 +36,19 @@ _AXIS = {
 }
 
 
+def _tooltip(digits: int) -> dict:
+    """Axis tooltip showing values to ``digits`` places. The ``:`` prefix makes
+    NiceGUI evaluate the formatter as JavaScript; ECharts throws on a string."""
+    return {
+        "trigger": "axis", "confine": True,
+        ":valueFormatter": f"(v) => v == null ? '-' : v.toFixed({digits})",
+        # Left of the cursor, clear of the value labels on the right of each point.
+        ":position": "(p, _a, _b, _c, s) => [p[0] - s.contentSize[0] - 16 >= 0 ? p[0] - s.contentSize[0] - 16 : p[0] + 16, "
+                     "Math.max(8, p[1] - s.contentSize[1] / 2)]",
+        "backgroundColor": "rgba(17,24,39,.92)", "borderWidth": 0, "textStyle": {"color": "#f3f4f6", "fontSize": 12},
+    }
+
+
 def _curve_options(history: List[Dict], metric_names: List[str]) -> dict:
     """ECharts options for the training curves. History rows restart at
     epoch 1 for every trial, so points are laid out sequentially and each
@@ -60,6 +73,13 @@ def _curve_options(history: List[Dict], metric_names: List[str]) -> dict:
             "data": [row.get(key) for row in history],
             "lineStyle": {"width": 2.5 if not is_loss else 2, "type": "solid" if not is_loss else "dashed"},
             "color": CHART_COLORS[i % len(CHART_COLORS)],
+            # The exact value, floating beside each point under the cursor.
+            "emphasis": {"label": {
+                "show": True, "position": "right", "distance": 8,
+                ":formatter": "(p) => p.value == null ? '' : p.value.toFixed(4)",
+                "color": "#ffffff", "fontSize": 11, "fontWeight": 600,
+                "backgroundColor": CHART_COLORS[i % len(CHART_COLORS)], "padding": [3, 6], "borderRadius": 4,
+            }},
         }
         if i == 0 and len(trial_starts) > 1:
             s["markLine"] = {
@@ -74,7 +94,7 @@ def _curve_options(history: List[Dict], metric_names: List[str]) -> dict:
         "animation": False,
         "backgroundColor": "transparent",
         "grid": {"left": 56, "right": 56, "top": 48, "bottom": 64},
-        "tooltip": {"trigger": "axis", "valueFormatter": "(v) => v == null ? '-' : v.toFixed(4)"},
+        "tooltip": _tooltip(4),
         "legend": {"top": 4, "textStyle": {"color": "#8b90a5"}, "icon": "roundRect"},
         "xAxis": {"type": "category", "data": labels, "boundaryGap": False, **_AXIS},
         "yAxis": [
@@ -102,7 +122,11 @@ def _roc_options(test_true, test_pred) -> Optional[dict]:
         "backgroundColor": "transparent",
         "grid": {"left": 56, "right": 24, "top": 40, "bottom": 48},
         "title": {"text": f"AUC = {area:.4f}", "left": "center", "top": 4, "textStyle": {"fontSize": 13, "color": "#8b90a5"}},
-        "tooltip": {"trigger": "axis", "valueFormatter": "(v) => v.toFixed(3)"},
+        # One line per FPR: the step curve can have several points at the same one.
+        "tooltip": {**_tooltip(3), ":formatter": """(ps) => {
+            const r = ps.filter(p => p.seriesName === 'ROC').pop();
+            return r ? `FPR ${r.value[0].toFixed(3)}<br>TPR ${r.value[1].toFixed(3)}` : '';
+        }"""},
         "xAxis": {"type": "value", "name": "FPR", "min": 0, "max": 1, "nameLocation": "middle", "nameGap": 28, **_AXIS},
         "yAxis": {"type": "value", "name": "TPR", "min": 0, "max": 1, **_AXIS},
         "series": [

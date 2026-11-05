@@ -3,10 +3,12 @@ Shared look-and-feel for the AutoMAX NiceGUI app: palette, session-status
 metadata, page CSS, and a few small reusable widgets (section cards, status
 chips, a server-side path picker).
 """
+import json
 import os
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 from nicegui import ui
 
@@ -22,6 +24,20 @@ STATUS = {
     "failed": ("Failed", "error", "negative"),
     "cancelled": ("Cancelled", "stop_circle", "warning"),
 }
+
+# modality -> (material icon, color), in the order datasets are grouped.
+MODALITY_STYLE = {
+    "X-Ray": ("personal_injury", "#0284c7"),
+    "CT": ("donut_large", "#4f46e5"),
+    "MRI": ("psychology", "#9333ea"),
+    "Ultrasound": ("graphic_eq", "#0d9488"),
+    "OCT": ("layers", "#d97706"),
+    "Fundus": ("visibility", "#dc2626"),
+    "Dermoscopy": ("back_hand", "#db2777"),
+    "Endoscopy": ("gesture", "#65a30d"),
+    "Microscopy": ("biotech", "#059669"),
+}
+_DEFAULT_MODALITY_STYLE = ("category", "#64748b")
 
 CHART_COLORS = ["#6366f1", "#f43f5e", "#10b981", "#f59e0b", "#06b6d4", "#a855f7"]
 
@@ -62,6 +78,15 @@ body { font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif; }
 .am-launch { border-radius: 12px; font-weight: 600; letter-spacing: .2px;
              background: linear-gradient(100deg, #4f46e5, #7c3aed) !important; }
 
+.am-group { display: flex; align-items: center; gap: 8px; padding: 12px 16px 4px;
+            font-size: 11px; font-weight: 700; letter-spacing: .6px; text-transform: uppercase; }
+.am-group-count { margin-left: auto; opacity: .7; font-weight: 500; }
+.am-modality-chip { display: inline-flex; align-items: center; gap: 4px; margin-left: 8px; padding: 1px 8px;
+                    border-radius: 999px; font-size: 11px; font-weight: 600; white-space: nowrap; }
+
+/* The modality colors are mid-tones, too dim on dark surfaces at this size. */
+.body--dark .am-group, .body--dark .am-modality-chip { filter: brightness(1.45); }
+
 .am-log { height: 420px; font-size: 12px; border-radius: 12px; }
 .body--light .am-log { background: #0f1220; color: #d7dbea; }
 .body--dark  .am-log { background: #0a0c13; color: #d7dbea; }
@@ -95,6 +120,48 @@ def section_card(title: str, icon: str, subtitle: Optional[str] = None) -> ui.ca
                 if subtitle:
                     ui.label(subtitle).classes("text-xs am-muted")
     return card
+
+
+def modality_sort_key(modality: str) -> int:
+    """Position of ``modality`` in the display order; unknown ones go last."""
+    order = list(MODALITY_STYLE)
+    return order.index(modality) if modality in order else len(order)
+
+
+def add_modality_groups(select: ui.select, modalities: Dict[str, str]) -> None:
+    """
+    Show ``select``'s options under a header per modality, and the selected one
+    with a modality chip. ``modalities`` maps option labels to modalities, in
+    display order, so each group must be contiguous. Other options show plainly.
+    """
+    counts = Counter(modalities.values())
+    meta, seen = {}, set()
+    for label, modality in modalities.items():
+        icon, color = MODALITY_STYLE.get(modality, _DEFAULT_MODALITY_STYLE)
+        meta[label] = {"modality": modality, "icon": icon, "color": color,
+                       "count": 0 if modality in seen else counts[modality]}
+        seen.add(modality)
+    # Embedded in a double-quoted Vue attribute, so it may only use single quotes.
+    lookup = json.dumps(meta).replace('"', "'") + "[props.opt.label]"
+    select.add_slot("option", f"""
+        <div v-for="m in [{lookup}]" :key="props.opt.value">
+            <div v-if="m && m.count" class="am-group" :style="{{color: m.color}}">
+                <q-icon :name="m.icon" size="16px" /><span>{{{{ m.modality }}}}</span>
+                <span class="am-group-count">{{{{ m.count }}}}</span>
+            </div>
+            <q-item v-bind="props.itemProps" dense>
+                <q-item-section :class="m ? 'q-pl-lg' : ''">{{{{ props.opt.label }}}}</q-item-section>
+            </q-item>
+        </div>
+    """)
+    select.add_slot("selected-item", f"""
+        <div v-for="m in [{lookup}]" :key="props.opt.value" class="row items-center no-wrap">
+            <span class="ellipsis">{{{{ props.opt.label }}}}</span>
+            <span v-if="m" class="am-modality-chip" :style="{{color: m.color, background: m.color + '1f'}}">
+                <q-icon :name="m.icon" size="13px" />{{{{ m.modality }}}}
+            </span>
+        </div>
+    """)
 
 
 def status_chip(status: str) -> ui.chip:

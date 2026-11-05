@@ -24,7 +24,7 @@ from libauc.trainer.data.benchmarks import BENCHMARKS, MEDMNIST_BENCHMARKS
 from ..custom_datasets import load_custom_csv_dataset
 from .dataset_config import get_dataset_config_store
 from .session_manager import get_session_manager
-from .theme import FIELD, PathPicker, section_card
+from .theme import FIELD, PathPicker, add_modality_groups, modality_sort_key, section_card
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +41,7 @@ _IMAGE_DATASETS = ["cifar10", "pneumoniamnist", "breastmnist", "chestmnist", "me
 # hiding the datasets above, custom datasets and the graph backend, which has
 # no benchmarks. Set to False to bring them back.
 _BENCHMARKS_ONLY = True
+_BENCHMARKS_BY_MODALITY = sorted(BENCHMARKS.items(), key=lambda kv: (modality_sort_key(kv[1]["modality"]), kv[1]["title"].lower()))
 
 # RADEO (Medicine_Foundation_Model encoder, see image_trainer's
 # _RADEOClassifier). The modality list mirrors libauc.models.radeo's
@@ -341,7 +342,8 @@ class ConfigurePanel:
         subtitle = "A medical evaluation benchmark" if _BENCHMARKS_ONLY else "A built-in benchmark or your own CSV-indexed images"
         with section_card("Dataset", "dataset", subtitle):
             with ui.row().classes("w-full items-start gap-3"):
-                self.dataset_select = ui.select({}, label="Dataset", on_change=self._dataset_changed).props(FIELD).classes("w-64")
+                self.dataset_select = ui.select({}, label="Dataset", on_change=self._dataset_changed).props(FIELD).classes("w-80")
+                add_modality_groups(self.dataset_select, {b["title"]: b["modality"] for _, b in _BENCHMARKS_BY_MODALITY})
                 # Predefined datasets: Root Path starts blank on purpose -- a
                 # predefined dataset can't be loaded without one, rather than
                 # silently defaulting to some "./data" that likely doesn't
@@ -464,7 +466,7 @@ class ConfigurePanel:
         return value
 
     def _dataset_options(self) -> dict:
-        benchmarks = {n: f"{b['title']}  ·  {b['modality']}" for n, b in BENCHMARKS.items()}
+        benchmarks = {n: b["title"] for n, b in _BENCHMARKS_BY_MODALITY}
         if _BENCHMARKS_ONLY:
             return benchmarks
         if self.backend == "gnn":
