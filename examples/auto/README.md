@@ -179,13 +179,15 @@ torchrun --nproc_per_node 4 -m libauc.trainer.run_image_trainer --config_file cf
 AutoMAX also ships a browser-based GUI (built with [NiceGUI](https://nicegui.io)) for configuring and launching a search without writing a YAML recipe by hand, plus a session manager for tracking, monitoring, and cancelling runs.
 
 ```bash
-python -m libauc.auto.ui.gui_main            # first free port from 8080; the URL is printed
+python -m libauc.auto.ui.gui_main            # first free port from 8080; prints the URL with its access token
 python -m libauc.auto.ui.gui_main --port 9000 --show
 ```
 
-It binds to `127.0.0.1` by default. On a remote machine you're SSH'd into, forward the port (VS Code's Remote-SSH does this automatically; otherwise `ssh -L 8080:localhost:8080 <host>`) and open the printed URL locally.
+It binds to `127.0.0.1` by default. On a remote machine you're SSH'd into, forward the port (VS Code's Remote-SSH does this automatically; otherwise `ssh -L 8080:localhost:8080 <host>`) and open the printed URL locally, changing the port if your forward uses a different one.
 
-On a cluster where the GUI runs on a compute node but you're connected to a login node, start it with `--host 0.0.0.0`. It then prints a URL like `http://<node>:8080/?token=...`. Forward `<node>:8080` from the login node (in VS Code's **Ports** panel, *Forward a Port* accepts `host:port`), then open `http://localhost:<forwarded port>/?token=...`. Every request needs that random token, so other users on the cluster network can't use your GUI. Folder/file browse buttons list the *server's* filesystem, where your data lives.
+The GUI can launch jobs and browse files as you, and a `127.0.0.1` port is open to every user logged in to that machine, so every request needs the random token in the printed URL. A cookie remembers it after the first visit, and restarting the GUI creates a new one. On a machine no one else can log in to, `--no-token` turns this off.
+
+On a cluster where the GUI runs on a compute node but you're connected to a login node, start it with `--host 0.0.0.0`. It then prints a URL like `http://<node>:8080/?token=...`. Forward `<node>:8080` from the login node (in VS Code's **Ports** panel, *Forward a Port* accepts `host:port`), then open `http://localhost:<forwarded port>/?token=...`. Folder/file browse buttons list the *server's* filesystem, where your data lives.
 
 The **New search** tab lets you:
 

@@ -3,11 +3,11 @@ GUI main entry point for AutoMAX: a NiceGUI web app.
 
 Usage::
 
-    python -m libauc.auto.ui.gui_main [--host 127.0.0.1] [--port 8080] [--show]
+    python -m libauc.auto.ui.gui_main [--host 127.0.0.1] [--port 8080] [--show] [--no-token]
 
 On a remote/cluster machine, forward the port (VS Code does this
-automatically; otherwise ``ssh -L 8080:localhost:8080 <host>``) and open
-http://localhost:8080 in a local browser.
+automatically; otherwise ``ssh -L 8080:localhost:8080 <host>``) and open the
+printed URL, with its access token, in a local browser.
 """
 
 import argparse
@@ -15,9 +15,11 @@ import logging
 import secrets
 import socket
 
-from fastapi import Request
-from fastapi.responses import PlainTextResponse
 from nicegui import app, ui
+from starlette.datastructures import MutableHeaders
+from starlette.requests import HTTPConnection
+from starlette.responses import PlainTextResponse
+from starlette.websockets import WebSocketClose
 
 from .gui import ConfigurePanel
 from .monitor import SessionsPanel
@@ -33,9 +35,6 @@ logging.basicConfig(
         logging.FileHandler("automax_gui.log"),
     ],
 )
-
-
-_TOKEN_COOKIE = "automax_token"
 
 
 @ui.page("/")
@@ -99,19 +98,46 @@ def _first_free_port(host: str, start: int, attempts: int = 50) -> int:
     raise SystemExit(f"No free port in {start}-{start + attempts - 1}; pass one with --port")
 
 
-def _require_token(token: str) -> None:
-    """Gate every HTTP request behind ``token``: accepted once as a
-    ``?token=`` query parameter, then remembered in a cookie."""
+class _TokenGate:
+    """
+    ASGI middleware requiring ``token`` on every HTTP request and websocket:
+    accepted once as a ``?token=`` query parameter, then remembered in a cookie.
 
-    @app.middleware("http")
-    async def check_token(request: Request, call_next):
-        if request.cookies.get(_TOKEN_COOKIE) == token:
-            return await call_next(request)
-        if request.query_params.get("token") == token:
-            response = await call_next(request)
-            response.set_cookie(_TOKEN_COOKIE, token, httponly=True, samesite="strict")
-            return response
-        return PlainTextResponse("AutoMAX: open the URL with ?token=... printed in the server terminal.", status_code=403)
+    The GUI can launch processes and browse the filesystem as whoever started
+    it, and a loopback port is open to every user logged in to the machine, so
+    this applies on loopback too. The cookie name includes the port because
+    cookies ignore ports: GUIs on one host would overwrite each other's.
+    """
+
+    def __init__(self, app, token: str, port: int):
+        self.app = app
+        self.token = token.encode()
+        self.cookie_name = f"automax_token_{port}"
+
+    def _matches(self, candidate: str) -> bool:
+        return secrets.compare_digest(candidate.encode(), self.token)
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] not in ("http", "websocket"):
+            return await self.app(scope, receive, send)
+
+        connection = HTTPConnection(scope)
+        if self._matches(connection.cookies.get(self.cookie_name, "")):
+            return await self.app(scope, receive, send)
+        if scope["type"] == "websocket":
+            return await WebSocketClose(code=1008)(scope, receive, send)
+        if not self._matches(connection.query_params.get("token", "")):
+            response = PlainTextResponse("AutoMAX: open the URL with ?token=... printed in the server terminal.", status_code=403)
+            return await response(scope, receive, send)
+
+        async def send_with_cookie(message):
+            if message["type"] == "http.response.start":
+                MutableHeaders(scope=message).append(
+                    "set-cookie", f"{self.cookie_name}={self.token.decode()}; Path=/; HttpOnly; SameSite=Strict"
+                )
+            await send(message)
+
+        await self.app(scope, receive, send_with_cookie)
 
 
 def main():
@@ -121,11 +147,19 @@ def main():
     parser.add_argument(
         "--host", default="127.0.0.1",
         help="interface to bind (default: 127.0.0.1). Use 0.0.0.0 to reach it from another node, "
-             "e.g. a GUI on a compute node viewed through the login node; access then needs a token.",
+             "e.g. a GUI on a compute node viewed through the login node.",
     )
     parser.add_argument("--port", type=int, default=None, help="port to serve on (default: first free port from 8080)")
     parser.add_argument("--show", action="store_true", help="open a browser tab on start")
+    parser.add_argument(
+        "--no-token", action="store_true",
+        help="don't require the access token. Only for --host 127.0.0.1 on a machine no one else can log in to.",
+    )
     args = parser.parse_args()
+
+    is_loopback = args.host in ("127.0.0.1", "localhost", "::1")
+    if args.no_token and not is_loopback:
+        parser.error("--no-token is only allowed with a loopback --host")
 
     if args.port is None:
         # Shared cluster nodes often have 8080 taken already.
@@ -135,18 +169,17 @@ def main():
     else:
         raise SystemExit(f"Port {args.port} is already in use; pick another with --port")
 
-    is_loopback = args.host in ("127.0.0.1", "localhost", "::1")
-    if is_loopback:
-        url = f"http://127.0.0.1:{port}"
-    else:
+    path = "/"
+    if not args.no_token:
         token = secrets.token_urlsafe(16)
-        _require_token(token)
-        url = f"http://{socket.gethostname()}:{port}/?token={token}"
+        app.add_middleware(_TokenGate, token=token, port=port)
+        path = f"/?token={token}"
+    url = f"http://{'127.0.0.1' if is_loopback else socket.gethostname()}:{port}{path}"
 
     get_session_manager()  # start liveness monitoring before the first page load
     app.on_startup(lambda: print(f"\nAutoMAX GUI: {url}\n", flush=True))
     ui.run(
-        host=args.host, port=port, show=args.show,
+        host=args.host, port=port, show=path if args.show else False,
         title="AutoMAX", favicon="📈", reload=False, show_welcome_message=False,
     )
 
