@@ -125,14 +125,22 @@ class _BenchmarkDataset(Dataset):
         return image, self.targets[idx].reshape(-1), (idx, task_id) if task_id is not None else idx
 
 
+# Folder name the benchmark CSVs were built under. Their absolute image paths
+# point into it on whichever machine made them.
+_EVAL_ROOT_MARKER = "Evaluation_Datasets_Medical_Project"
+
+
 class ClassCSVDataset(_BenchmarkDataset):
     """A ``path,class`` CSV (class names as strings, one class per image).
-    Relative image paths are resolved against ``image_root``."""
+    Relative image paths are resolved against ``image_root``. Absolute paths
+    that don't exist here but contain ``Evaluation_Datasets_Medical_Project/``
+    are remapped onto ``data_root`` (the local copy of that folder)."""
 
     def __init__(self, df: pd.DataFrame, classes: List[str], transform, image_root: str = "",
-                 positive: Optional[str] = None):
+                 positive: Optional[str] = None, data_root: str = ""):
         self.paths = df["path"].tolist()
         self.image_root = image_root
+        self.data_root = data_root
         self.transform = transform
         self.classes = list(classes)
         if positive is not None:
@@ -148,7 +156,20 @@ class ClassCSVDataset(_BenchmarkDataset):
         path = self.paths[idx]
         if not os.path.isabs(path):
             path = os.path.join(self.image_root, path)
+        elif self.data_root and not os.path.exists(path):
+            path = _remap_to_root(path, self.data_root)
         return Image.open(path).convert("RGB")
+
+
+def _remap_to_root(path: str, data_root: str) -> str:
+    """Rebase an absolute path from another machine onto ``data_root`` by
+    keeping only what follows the ``Evaluation_Datasets_Medical_Project/``
+    component; returns ``path`` unchanged if the marker isn't in it."""
+    marker = "/" + _EVAL_ROOT_MARKER + "/"
+    i = path.rfind(marker)
+    if i < 0:
+        return path
+    return os.path.join(data_root, path[i + len(marker):])
 
 
 class MedMNISTDataset(_BenchmarkDataset):
@@ -235,7 +256,7 @@ def load_benchmark_dataset(name: str, splits: List[str], root_path: str, val_fra
     full_train = _read_csv(train_csv)
     train_df, val_df = _stratified_split(full_train, val_frac, val_seed)
     classes = sorted(full_train["class"].unique())
-    train = ClassCSVDataset(train_df, classes, train_tf, image_root, positive)
+    train = ClassCSVDataset(train_df, classes, train_tf, image_root, positive, data_root=root_path)
     logger.info(f"[{spec['title']}] {len(classes)} classes, train {len(train_df)} / val {len(val_df)}")
 
     evals = []
@@ -246,5 +267,5 @@ def load_benchmark_dataset(name: str, splits: List[str], root_path: str, val_fra
             df = _read_csv(os.path.join(root_path, spec["test"]))
         else:
             raise NotImplementedError(f"Split '{split}' is not implemented for dataset '{name}'.")
-        evals.append(ClassCSVDataset(df, classes, test_tf, image_root, positive))
+        evals.append(ClassCSVDataset(df, classes, test_tf, image_root, positive, data_root=root_path))
     return train, evals
