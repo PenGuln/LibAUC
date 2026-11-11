@@ -130,3 +130,7 @@ log
 outputs
 .history
 
+
+# AutoMAX GUI state (remembered dataset paths, sessions, logs)
+gui_sessions/
+automax_gui_server.log

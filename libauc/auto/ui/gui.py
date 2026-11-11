@@ -20,7 +20,7 @@ import numpy as np
 from nicegui import run, ui
 
 from libauc.trainer import Trainer, load_dataset, parse_defaultconfig
-from libauc.trainer.data.benchmarks import BENCHMARKS, MEDMNIST_BENCHMARKS
+from libauc.trainer.data.benchmarks import BENCHMARKS
 
 from ..custom_datasets import load_custom_csv_dataset
 from .dataset_config import get_dataset_config_store
@@ -54,11 +54,6 @@ _RADEO_MODALITIES = ["X-Ray", "CT", "Microscopy", "Endoscopy", "Fundus", "Dermos
 _RADEO_TUNING_MODES = {"linear_probe": "Linear probe", "full_finetune": "Fine-tune"}
 _IMAGE_MODELS.append(_RADEO)
 
-# Defaults suggested for paths not yet remembered in the dataset config
-# store, used only when they exist on this machine (the TAMU cluster).
-_RADEO_DEFAULT_CHECKPOINT = "/scratch/project/prj-02-medical-foundation-model/anant/weights/CH-4worker-mlp-dim256-RADEO60M-rho5/temp5-CHMLP"
-_BENCHMARK_CSV_ROOT = "/scratch/project/prj-02-medical-foundation-model/datasets/Evaluation_Datasets_Medical_Project"
-_BENCHMARK_MEDMNIST_ROOT = "/scratch/project/prj-02-medical-foundation-model/medMNIST2d"
 _GNN_MODELS = ["gcn", "gin", "gine", "graphsage", "gat", "mpnn", "deepergcn", "pna"]
 _GNN_DATASETS = ["ogbg-molhiv", "ogbg-moltox21", "ogbg-molmuv", "ogbg-molpcba"]
 
@@ -333,7 +328,6 @@ class ConfigurePanel:
                 with ui.row().classes("w-full items-center gap-1 no-wrap"):
                     self.radeo_checkpoint = ui.input(
                         "RADEO checkpoint folder (with config.json)",
-                        value=_RADEO_DEFAULT_CHECKPOINT if os.path.isdir(_RADEO_DEFAULT_CHECKPOINT) else "",
                         on_change=self.refresh_summary,
                     ).props(FIELD).classes("grow am-mono")
                     ui.button(icon="folder_open", on_click=lambda: self._browse(self.radeo_checkpoint)).props("flat round dense")
@@ -734,11 +728,7 @@ class ConfigurePanel:
             self.custom_image_size.value = saved.get("image_size", 224)
         elif self.dataset_select.value and not is_custom_image and not self._is_custom_gnn_dataset:
             # Recall the last-used Root Path for this predefined dataset.
-            root_path = self.store.get_root_path(self.dataset_name)
-            if not root_path and self.dataset_name in BENCHMARKS:
-                default = _BENCHMARK_MEDMNIST_ROOT if self.dataset_name in MEDMNIST_BENCHMARKS else _BENCHMARK_CSV_ROOT
-                root_path = default if os.path.isdir(default) else ""
-            self.dataset_root_path.value = root_path
+            self.dataset_root_path.value = self.store.get_root_path(self.dataset_name)
 
         benchmark = BENCHMARKS.get(self.dataset_name or "")
         if benchmark:
