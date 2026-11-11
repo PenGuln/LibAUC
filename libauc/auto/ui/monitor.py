@@ -290,6 +290,8 @@ class SessionsPanel:
                         ("functions", f"{training.get('loss', '?')} + {training.get('optimizer', '?')}"),
                         ("schedule", f"started {relative_time(s.start_time)}"),
                         ("dns", s.hostname or "unknown host"),
+                        *([("memory", "GPU " + ", ".join(str(g["index"]) for g in gpus))]
+                          if (gpus := s.config.get("gui", {}).get("gpus")) else []),
                     ):
                         ui.chip(text, icon=icon, color="grey-7").props("outline dense")
                 if s.error_message:

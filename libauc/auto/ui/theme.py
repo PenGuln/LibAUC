@@ -87,6 +87,12 @@ body { font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif; }
 /* The modality colors are mid-tones, too dim on dark surfaces at this size. */
 .body--dark .am-group, .body--dark .am-modality-chip { filter: brightness(1.45); }
 
+.am-gpu { cursor: pointer; border-radius: 12px; padding: 10px 12px; border: 1px solid rgba(127,127,127,.18);
+          transition: background .15s, border-color .15s; }
+.am-gpu:hover { background: rgba(99,102,241,.06); }
+.am-gpu.am-selected { border-color: var(--q-primary); background: rgba(99,102,241,.10); }
+.am-gpu.am-gpu-off { opacity: .45; cursor: not-allowed; }
+
 .am-log { height: 420px; font-size: 12px; border-radius: 12px; }
 .body--light .am-log { background: #0f1220; color: #d7dbea; }
 .body--dark  .am-log { background: #0a0c13; color: #d7dbea; }

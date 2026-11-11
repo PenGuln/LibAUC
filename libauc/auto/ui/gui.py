@@ -9,6 +9,7 @@ import inspect
 import json
 import logging
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -23,6 +24,7 @@ from libauc.trainer.data.benchmarks import BENCHMARKS, MEDMNIST_BENCHMARKS
 
 from ..custom_datasets import load_custom_csv_dataset
 from .dataset_config import get_dataset_config_store
+from .gpus import GPUInfo, query_gpus
 from .session_manager import get_session_manager
 from .theme import FIELD, PathPicker, add_modality_groups, modality_sort_key, section_card
 
@@ -121,6 +123,16 @@ _worker_processes: List[subprocess.Popen] = []
 
 def reap_finished_workers() -> None:
     _worker_processes[:] = [p for p in _worker_processes if p.poll() is None]
+
+
+def _meter(label: str, value: Optional[float], total: Optional[float], text: Optional[str]) -> None:
+    """A one-line labelled bar, coloured by how full it is."""
+    fraction = min(max(value / total, 0.0), 1.0) if value is not None and total else 0.0
+    color = "positive" if fraction < 0.5 else "warning" if fraction < 0.85 else "negative"
+    with ui.row().classes("items-center w-full no-wrap gap-2"):
+        ui.label(label).classes("text-xs am-muted w-8 shrink-0")
+        ui.linear_progress(fraction, show_value=False, size="6px", color=color).classes("grow rounded")
+        ui.label(text or "n/a").classes("text-xs am-mono w-28 text-right shrink-0 whitespace-nowrap")
 
 
 def _literal(text: str, what: str):
@@ -274,6 +286,10 @@ class ConfigurePanel:
         self._custom_train_csv = ""
         self._custom_val_csv = ""
         self._custom_test_csv = ""
+        self.gpus: List[GPUInfo] = []
+        self.gpu_error: Optional[str] = None
+        self.selected_gpus: List[str] = []  # UUIDs
+        self._gpu_chosen = False  # the user picked; stop preselecting
 
         with ui.element("div").classes("w-full grid grid-cols-1 lg:grid-cols-12 gap-6 items-start"):
             with ui.column().classes("lg:col-span-8 gap-6 min-w-0"):
@@ -284,6 +300,7 @@ class ConfigurePanel:
                 self._build_training_card()
             with ui.column().classes("lg:col-span-4 gap-6"):
                 self._build_summary_card()
+                self._build_gpu_card()
 
         self._backend_changed()
         self._metric_changed()
@@ -426,6 +443,79 @@ class ConfigurePanel:
                 "Training runs in its own process. Closing this page or the server does not stop it."
             ).classes("text-xs am-muted")
 
+    def _build_gpu_card(self):
+        with section_card("GPUs", "memory", f"On {socket.gethostname()}; click one to train on it"):
+            with ui.column().classes("w-full gap-2") as self.gpu_box:
+                ui.label("Loading GPU status...").classes("text-sm am-muted")
+        ui.timer(0.1, self._refresh_gpus, once=True)
+        ui.timer(3.0, self._refresh_gpus)
+
+    # ------------------------------------------------------------------
+    # GPUs
+    # ------------------------------------------------------------------
+
+    async def _refresh_gpus(self):
+        self.gpus, self.gpu_error = await run.io_bound(query_gpus)
+        before = list(self.selected_gpus)
+        available = [g for g in self.gpus if g.allowed]
+        self.selected_gpus = [u for u in self.selected_gpus if u in {g.uuid for g in available}]
+        if not self.selected_gpus and available and not self._gpu_chosen:
+            least_used = min(available, key=lambda g: (bool(g.processes), g.memory_used or 0, g.utilization or 0))
+            self.selected_gpus = [least_used.uuid]
+        self._render_gpus()
+        if self.selected_gpus != before:
+            self.refresh_summary()
+
+    def _select_gpu(self, uuid: str):
+        self.selected_gpus = [uuid]
+        self._gpu_chosen = True
+        self._render_gpus()
+        self.refresh_summary()
+
+    @property
+    def _selected_gpu_infos(self) -> List[GPUInfo]:
+        return [g for g in self.gpus if g.uuid in self.selected_gpus]
+
+    def _render_gpus(self):
+        self.gpu_box.clear()
+        with self.gpu_box:
+            if not self.gpus:
+                with ui.row().classes("items-start gap-2 no-wrap"):
+                    ui.icon("info", size="18px").classes("am-muted")
+                    ui.label(f"No GPUs found ({self.gpu_error}). Training will use whatever GPU CUDA finds.").classes("text-sm am-muted")
+                return
+            for gpu in self.gpus:
+                self._gpu_tile(gpu)
+
+    def _gpu_tile(self, gpu: GPUInfo):
+        selected = gpu.uuid in self.selected_gpus
+        tile = ui.column().classes("am-gpu w-full gap-1" + (" am-selected" if selected else "") + ("" if gpu.allowed else " am-gpu-off"))
+        if gpu.allowed:
+            tile.on("click", lambda _, uuid=gpu.uuid: self._select_gpu(uuid))
+        with tile:
+            with ui.row().classes("items-center w-full no-wrap gap-2"):
+                ui.icon("check_circle" if selected else "radio_button_unchecked", size="18px").classes(
+                    "text-primary" if selected else "am-muted")
+                ui.label(f"GPU {gpu.index}").classes("font-semibold text-sm shrink-0")
+                ui.label(gpu.name).classes("text-xs am-muted truncate grow")
+                if gpu.temperature is not None:
+                    ui.label(f"{gpu.temperature:.0f}°C").classes("text-xs am-muted am-mono shrink-0")
+            _meter("Util", gpu.utilization, 100, None if gpu.utilization is None else f"{gpu.utilization:.0f}%")
+            memory = None
+            if gpu.memory_used is not None and gpu.memory_total:
+                memory = f"{gpu.memory_used / 1024:.1f} / {gpu.memory_total / 1024:.0f} GB"
+            _meter("Mem", gpu.memory_used, gpu.memory_total, memory)
+            if not gpu.allowed:
+                text = "Not in this job's GPU allocation"
+            elif gpu.processes:
+                users = {}
+                for p in gpu.processes:
+                    users[p.user] = users.get(p.user, 0) + 1
+                text = "In use by " + ", ".join(f"{u} ({n})" if n > 1 else u for u, n in users.items())
+            else:
+                text = "Idle"
+            ui.label(text).classes("text-xs am-muted truncate w-full")
+
     # ------------------------------------------------------------------
     # Derived state
     # ------------------------------------------------------------------
@@ -499,6 +589,8 @@ class ConfigurePanel:
             issues.append("Set the dataset root path")
         if not self.loss_select.value:
             issues.append("Choose a loss function")
+        if self.gpus and not self.selected_gpus:
+            issues.append("Choose a GPU" if any(g.allowed for g in self.gpus) else "None of these GPUs are allocated to this job")
         return issues
 
     def refresh_summary(self, *_):
@@ -512,6 +604,7 @@ class ConfigurePanel:
             ("Loss", self.loss_select.value or "-"),
             ("Optimizer", self.optimizers.type_name or "-"),
             ("Budget", f"{n_trials} trials x {epochs} epochs"),
+            ("GPU", ", ".join(str(g.index) for g in self._selected_gpu_infos) or ("-" if self.gpus else "auto")),
         ]
         self.summary_box.clear()
         with self.summary_box:
@@ -845,6 +938,10 @@ class ConfigurePanel:
         if not self._is_custom_image_dataset:
             self.store.set_root_path(self.dataset_name, self.dataset_root_path.value.strip())
 
+        gpus = self._selected_gpu_infos
+        # build_pipeline() ignores this; it's for the Sessions page.
+        config["gui"] = {"gpus": [{"index": g.index, "uuid": g.uuid, "name": g.name} for g in gpus]}
+
         session_name = f"{self.model_name}_{self.loss_select.value}_{self.dataset_name}"
         try:
             session = self.session_manager.create_session(session_name, config, backend=self.backend)
@@ -852,7 +949,7 @@ class ConfigurePanel:
             ui.notify(str(exc), type="negative")
             return
         try:
-            process = self._start_training_process(session.session_id, session.log_file, config)
+            process = self._start_training_process(session.session_id, session.log_file, config, [g.uuid for g in gpus])
         except Exception as exc:
             self.session_manager.complete_session(session.session_id, error_message=f"Failed to start worker: {exc}")
             ui.notify(f"Failed to start training process: {exc}", type="negative")
@@ -860,10 +957,13 @@ class ConfigurePanel:
         ui.notify(f"Launched {session_name} (PID {process.pid})", type="positive", icon="rocket_launch")
         self.on_launched(session.session_id)
 
-    def _start_training_process(self, session_id: str, log_path: str, config: dict) -> subprocess.Popen:
+    def _start_training_process(self, session_id: str, log_path: str, config: dict, gpu_uuids: List[str]) -> subprocess.Popen:
         config_file = Path(tempfile.gettempdir()) / f"automax_gui_session_{session_id}.json"
         with open(config_file, "w", encoding="utf-8") as f:
             json.dump(config, f)
+        env = dict(os.environ)
+        if gpu_uuids:
+            env["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_uuids)
         with open(log_path, "a", encoding="utf-8") as log_fh:
             process = subprocess.Popen(
                 [sys.executable, "-m", "libauc.auto.ui.training_worker", "--config", str(config_file), "--session-id", session_id],
@@ -872,6 +972,7 @@ class ConfigurePanel:
                 # Detach from the GUI's terminal, so Ctrl-C or closing it
                 # stops the GUI but not training.
                 start_new_session=True,
+                env=env,
                 stdout=log_fh,
                 stderr=subprocess.STDOUT,
             )
