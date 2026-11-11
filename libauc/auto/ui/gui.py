@@ -444,7 +444,15 @@ class ConfigurePanel:
             ).classes("text-xs am-muted")
 
     def _build_gpu_card(self):
-        with section_card("GPUs", "memory", f"On {socket.gethostname()}; click one to train on it"):
+        with section_card("GPUs", "memory", f"On {socket.gethostname()}; click to choose where to train"):
+            with ui.row().classes("w-full gap-3 no-wrap"):
+                self.n_parallel = ui.number(
+                    "Trials at once", value=1, min=1, max=64, precision=0, on_change=self._parallel_changed,
+                ).props(FIELD).classes("grow min-w-0")
+                self.gpus_per_trial = ui.number(
+                    "GPUs per trial", value=1, min=1, max=16, precision=0, on_change=self._parallel_changed,
+                ).props(FIELD).classes("grow min-w-0")
+            self.gpu_note = ui.label("").classes("text-xs am-muted")
             with ui.column().classes("w-full gap-2") as self.gpu_box:
                 ui.label("Loading GPU status...").classes("text-sm am-muted")
         ui.timer(0.1, self._refresh_gpus, once=True)
@@ -454,29 +462,74 @@ class ConfigurePanel:
     # GPUs
     # ------------------------------------------------------------------
 
+    @property
+    def _trials_at_once(self) -> int:
+        return max(int(self.n_parallel.value or 1), 1)
+
+    @property
+    def _gpus_per_trial(self) -> int:
+        return max(int(self.gpus_per_trial.value or 1), 1)
+
+    @property
+    def _is_parallel(self) -> bool:
+        return self._trials_at_once > 1 or self._gpus_per_trial > 1
+
+    @property
+    def _gpus_wanted(self) -> int:
+        return self._trials_at_once * self._gpus_per_trial
+
+    def _preselect_gpus(self):
+        """Until the user picks, take the least-used GPUs, idle ones first."""
+        available = sorted((g for g in self.gpus if g.allowed),
+                           key=lambda g: (bool(g.processes), g.memory_used or 0, g.utilization or 0))
+        self.selected_gpus = [g.uuid for g in available[:self._gpus_wanted]]
+
     async def _refresh_gpus(self):
         self.gpus, self.gpu_error = await run.io_bound(query_gpus)
         before = list(self.selected_gpus)
-        available = [g for g in self.gpus if g.allowed]
-        self.selected_gpus = [u for u in self.selected_gpus if u in {g.uuid for g in available}]
-        if not self.selected_gpus and available and not self._gpu_chosen:
-            least_used = min(available, key=lambda g: (bool(g.processes), g.memory_used or 0, g.utilization or 0))
-            self.selected_gpus = [least_used.uuid]
+        available = {g.uuid for g in self.gpus if g.allowed}
+        self.selected_gpus = [u for u in self.selected_gpus if u in available]
+        if not self._gpu_chosen and len(self.selected_gpus) < min(self._gpus_wanted, len(available)):
+            self._preselect_gpus()
         self._render_gpus()
         if self.selected_gpus != before:
             self.refresh_summary()
 
+    def _parallel_changed(self, *_):
+        if self._gpu_chosen:
+            self.selected_gpus = self.selected_gpus[-self._gpus_wanted:]
+        else:
+            self._preselect_gpus()
+        self._render_gpus()
+        self.refresh_summary()
+
     def _select_gpu(self, uuid: str):
-        self.selected_gpus = [uuid]
+        """Toggle a GPU; past the number needed, the earliest pick is dropped,
+        so with one GPU needed a click simply switches to it."""
+        if uuid in self.selected_gpus:
+            if len(self.selected_gpus) > 1:
+                self.selected_gpus.remove(uuid)
+        else:
+            self.selected_gpus.append(uuid)
+            del self.selected_gpus[:-self._gpus_wanted]
         self._gpu_chosen = True
         self._render_gpus()
         self.refresh_summary()
 
     @property
     def _selected_gpu_infos(self) -> List[GPUInfo]:
-        return [g for g in self.gpus if g.uuid in self.selected_gpus]
+        # By index: the order of CUDA_VISIBLE_DEVICES decides the GPU slots.
+        return sorted((g for g in self.gpus if g.uuid in self.selected_gpus), key=lambda g: g.index)
 
     def _render_gpus(self):
+        notes = []
+        if self._gpus_per_trial > 1:
+            notes.append(f"Each trial trains with DDP on {self._gpus_per_trial} GPUs; batch size is per GPU.")
+        if self.gpus and len(self.selected_gpus) < self._gpus_wanted:
+            notes.append(f"{self._trials_at_once} x {self._gpus_per_trial} needs {self._gpus_wanted} GPUs; "
+                         "with fewer, trials share GPUs.")
+        self.gpu_note.text = " ".join(notes)
+        self.gpu_note.visible = bool(notes)
         self.gpu_box.clear()
         with self.gpu_box:
             if not self.gpus:
@@ -591,6 +644,10 @@ class ConfigurePanel:
             issues.append("Choose a loss function")
         if self.gpus and not self.selected_gpus:
             issues.append("Choose a GPU" if any(g.allowed for g in self.gpus) else "None of these GPUs are allocated to this job")
+        elif self.gpus and len(self.selected_gpus) < self._gpus_per_trial:
+            issues.append(f"Choose at least {self._gpus_per_trial} GPUs for each trial")
+        elif not self.gpus and self._is_parallel:
+            issues.append("Parallel search needs GPUs, and none were found")
         return issues
 
     def refresh_summary(self, *_):
@@ -605,6 +662,8 @@ class ConfigurePanel:
             ("Optimizer", self.optimizers.type_name or "-"),
             ("Budget", f"{n_trials} trials x {epochs} epochs"),
             ("GPU", ", ".join(str(g.index) for g in self._selected_gpu_infos) or ("-" if self.gpus else "auto")),
+            *([("Parallel", f"{self._trials_at_once} trials x {self._gpus_per_trial} GPU" + ("s" if self._gpus_per_trial > 1 else ""))]
+              if self._is_parallel else []),
         ]
         self.summary_box.clear()
         with self.summary_box:
@@ -904,6 +963,12 @@ class ConfigurePanel:
             "SEED": int(self.seed.value),
             "name": "placeholder",  # overwritten by SessionManager.create_session
             "overwrite": True,
+            "n_workers": self._trials_at_once,
+            "gpus_per_trial": self._gpus_per_trial,
+            # fork, not spawn: spawn pickles the trainer with its datasets for every
+            # trial (gigabytes for the 224px MedMNIST sets). The worker hasn't
+            # touched CUDA before forking, so it is safe here.
+            "start_method": "fork",
         }
 
         if self._is_custom_image_dataset:

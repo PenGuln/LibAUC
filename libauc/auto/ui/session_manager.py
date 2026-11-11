@@ -62,6 +62,9 @@ class SessionInfo:
     pid_create_time: Optional[float] = None  # tells the worker from a later process reusing `pid`
     last_heartbeat: Optional[str] = None
     error_message: Optional[str] = None
+    # Parallel searches: trial name -> {"gpus", "epoch", "epochs"} for each
+    # trial in progress. `trial` then counts finished trials.
+    running_trials: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     test_true: Optional[List[float]] = None  # final epoch of the best/last trial only
     test_pred: Optional[List[float]] = None
 
@@ -83,6 +86,7 @@ class SessionManager:
         logs_dir: str = "gui_sessions/logs",
         runs_dir: str = "gui_sessions/runs",
         automax_output_dir: str = "gui_sessions/automax_output",
+        monitor: bool = True,
     ):
         self.sessions_file = Path(sessions_file)
         self.logs_dir = Path(logs_dir)
@@ -106,7 +110,14 @@ class SessionManager:
         self._last_gui_update = None
 
         self._load_sessions()
-        self.start_monitoring()
+        if monitor:
+            self.start_monitoring()
+
+    @property
+    def paths(self) -> Dict[str, str]:
+        """Constructor arguments that make another SessionManager on the same files."""
+        return {"sessions_file": str(self.sessions_file.resolve()), "logs_dir": str(self.logs_dir.resolve()),
+                "runs_dir": str(self.runs_dir.resolve()), "automax_output_dir": str(self.automax_output_dir.resolve())}
 
     # ------------------------------------------------------------------
     # Persistence
@@ -243,6 +254,27 @@ class SessionManager:
             session.last_heartbeat = datetime.now().isoformat()
             return self._save_sessions()
 
+    def update_trial(self, session_id: str, trial: str, finished: bool = False, **fields) -> bool:
+        """
+        Update (or, with ``finished``, drop) one entry of a parallel session's
+        ``running_trials``, and recompute ``progress`` from finished trials plus
+        the epochs done by running ones. Atomic, since several trial processes
+        and the driver update the same session.
+        """
+        with self._transaction() as loaded:
+            if not loaded or session_id not in self.sessions:
+                return False
+            session = self.sessions[session_id]
+            if finished:
+                session.running_trials.pop(trial, None)
+            else:
+                session.running_trials.setdefault(trial, {}).update(fields)
+            partial = sum(t.get("epoch", 0) / t["epochs"] for t in session.running_trials.values() if t.get("epochs"))
+            if session.n_trials:
+                session.progress = min((session.trial + partial) / session.n_trials, 1.0)
+            session.last_heartbeat = datetime.now().isoformat()
+            return self._save_sessions()
+
     def record_worker(self, session_id: str, pid: int) -> bool:
         """Record the process running a session, which is on this host."""
         try:
@@ -315,7 +347,8 @@ class SessionManager:
         if session.status == "running" and not self.cancel_session(session_id):
             return False
 
-        for path_str in (session.log_file, str(self._history_file(session_id))):
+        leftovers = [str(p) for p in self.logs_dir.glob(f"session_{session_id}_*_predictions.json")]
+        for path_str in (session.log_file, str(self._history_file(session_id)), *leftovers):
             try:
                 path = Path(path_str)
                 if path.exists():
@@ -473,9 +506,12 @@ class SessionManager:
         return self.logs_dir / f"session_{session_id}_history.jsonl"
 
     def append_epoch_history(
-        self, session_id: str, epoch: int, train_loss: float, metrics: Optional[Dict[str, Any]] = None
+        self, session_id: str, epoch: int, train_loss: float, metrics: Optional[Dict[str, Any]] = None,
+        trial: Optional[str] = None,
     ):
         entry = {"epoch": epoch, "train_loss": train_loss}
+        if trial is not None:
+            entry["trial"] = trial
         for key, value in (metrics or {}).items():
             if isinstance(value, (int, float)):
                 entry[key] = value
@@ -484,6 +520,28 @@ class SessionManager:
                 f.write(json.dumps(entry) + "\n")
         except Exception as e:
             logger.error(f"Error appending epoch history for session {session_id}: {e}")
+
+    def _predictions_file(self, session_id: str, trial: str) -> Path:
+        return self.logs_dir / f"session_{session_id}_{trial}_predictions.json"
+
+    def save_trial_predictions(self, session_id: str, trial: str, test_true, test_pred) -> None:
+        """Keep a parallel trial's last validation predictions until the driver
+        knows whether it was the best trial (see load_trial_predictions)."""
+        try:
+            atomic_write_json(self._predictions_file(session_id, trial), {"test_true": test_true, "test_pred": test_pred})
+        except Exception as e:
+            logger.error(f"Error saving predictions of {trial} for session {session_id}: {e}")
+
+    def load_trial_predictions(self, session_id: str, trial: str, remove: bool = True) -> Optional[Dict[str, Any]]:
+        path = self._predictions_file(session_id, trial)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return None
+        if remove:
+            path.unlink(missing_ok=True)
+        return data
 
     def get_epoch_history(self, session_id: str, max_points: int = 200) -> List[Dict[str, Any]]:
         path = self._history_file(session_id)

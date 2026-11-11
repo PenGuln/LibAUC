@@ -9,6 +9,7 @@ never talks to a training worker directly.
 import json
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -36,12 +37,17 @@ _AXIS = {
 }
 
 
+def _is_parallel(s: SessionInfo) -> bool:
+    automax = s.config.get("automax", {})
+    return int(automax.get("n_workers") or 1) > 1 or int(automax.get("gpus_per_trial") or 1) > 1
+
+
 def _tooltip(digits: int) -> dict:
     """Axis tooltip showing values to ``digits`` places. The ``:`` prefix makes
     NiceGUI evaluate the formatter as JavaScript; ECharts throws on a string."""
     return {
         "trigger": "axis", "confine": True,
-        ":valueFormatter": f"(v) => v == null ? '-' : v.toFixed({digits})",
+        ":valueFormatter": f"(v) => typeof v === 'number' ? v.toFixed({digits}) : '-'",
         # Left of the cursor, clear of the value labels on the right of each point.
         ":position": "(p, _a, _b, _c, s) => [p[0] - s.contentSize[0] - 16 >= 0 ? p[0] - s.contentSize[0] - 16 : p[0] + 16, "
                      "Math.max(8, p[1] - s.contentSize[1] / 2)]",
@@ -50,20 +56,28 @@ def _tooltip(digits: int) -> dict:
 
 
 def _curve_options(history: List[Dict], metric_names: List[str]) -> dict:
-    """ECharts options for the training curves. History rows restart at
-    epoch 1 for every trial, so points are laid out sequentially and each
-    trial boundary gets a dashed marker line, with loss on the left axis and
-    metrics on the right."""
-    labels, trial_starts = [], []
-    trial, prev_epoch = 0, None
-    for i, row in enumerate(history):
-        if prev_epoch is None or row["epoch"] <= prev_epoch:
-            trial += 1
-            trial_starts.append((i, trial))
-        prev_epoch = row["epoch"]
-        labels.append(f"T{trial} · E{row['epoch']}")
+    """ECharts options for the training curves: each trial's epochs laid out
+    one trial after another, with a dashed marker line at each trial start,
+    loss on the left axis and metrics on the right."""
+    if all("trial" in row for row in history):
+        # Rows name their trial; group by it, since parallel trials interleave.
+        order = {}
+        for row in history:
+            order.setdefault(row["trial"], len(order))
+        history = sorted(history, key=lambda row: order[row["trial"]])  # stable: epochs stay in order
+        numbers = [re.sub(r"\D", "", row["trial"]) or str(order[row["trial"]] + 1) for row in history]
+    else:
+        # Older sessions: a trial starts wherever the epoch count restarts.
+        numbers, trial, prev_epoch = [], 0, None
+        for row in history:
+            if prev_epoch is None or row["epoch"] <= prev_epoch:
+                trial += 1
+            prev_epoch = row["epoch"]
+            numbers.append(str(trial))
+    labels = [f"T{n} · E{row['epoch']}" for n, row in zip(numbers, history)]
+    trial_starts = [(i, n) for i, n in enumerate(numbers) if i == 0 or n != numbers[i - 1]]
 
-    keys = ["train_loss"] + sorted({k for row in history for k in row} - {"epoch", "train_loss"}, key=lambda k: (k not in metric_names, k))
+    keys = ["train_loss"] + sorted({k for row in history for k in row} - {"epoch", "train_loss", "trial"}, key=lambda k: (k not in metric_names, k))
     series = []
     for i, key in enumerate(keys):
         is_loss = key == "train_loss"
@@ -300,6 +314,8 @@ class SessionsPanel:
                         ui.label(s.error_message).classes("text-negative text-sm am-mono break-all")
 
             self.kpi_box = ui.element("div").classes("w-full grid grid-cols-2 xl:grid-cols-5 gap-3")
+            self.running_box = ui.card().props("flat").classes("am-card w-full gap-2")
+            self.running_box.visible = False
 
             with ui.card().props("flat").classes("am-card w-full gap-2 p-0"):
                 with ui.tabs(value=self.detail_tab, on_change=lambda e: setattr(self, "detail_tab", e.value)).props(
@@ -341,7 +357,8 @@ class SessionsPanel:
     def _update_live(self, s: SessionInfo):
         history = self.session_manager.get_epoch_history(s.session_id, max_points=0)
         log_size = Path(s.log_file).stat().st_size if s.log_file and os.path.exists(s.log_file) else 0
-        sig = (s.trial, s.current_epoch, round(s.progress, 4), s.loss, len(history), log_size, relative_time(s.start_time))
+        sig = (s.trial, s.current_epoch, round(s.progress, 4), s.loss, len(history), log_size, relative_time(s.start_time),
+               json.dumps(s.running_trials, sort_keys=True))
         if sig == self._live_sig:
             return
         self._live_sig = sig
@@ -351,10 +368,19 @@ class SessionsPanel:
         self.kpi_box.clear()
         with self.kpi_box:
             stat_tile("Progress", f"{s.progress:.0%}", "donut_large")
-            stat_tile("Trial", f"{s.trial}/{s.n_trials}", "science")
-            stat_tile("Epoch", f"{s.current_epoch}/{s.epochs}", "repeat")
-            stat_tile(f"Best {primary or 'metric'}", f"{best:.4f}" if best is not None else "-", "emoji_events", f"loss {s.loss:.4f}")
+            parallel = _is_parallel(s)
+            stat_tile("Trial", f"{s.trial}/{s.n_trials}", "science", f"{len(s.running_trials)} running" if parallel else None)
+            if parallel:
+                automax = s.config.get("automax", {})
+                stat_tile("Parallel", f"{automax.get('n_workers', 1)} x {automax.get('gpus_per_trial', 1)}", "call_split",
+                          "trials x GPUs each")
+            else:
+                stat_tile("Epoch", f"{s.current_epoch}/{s.epochs}", "repeat")
+            stat_tile(f"Best {primary or 'metric'}", f"{best:.4f}" if best is not None else "-", "emoji_events",
+                      None if parallel else f"loss {s.loss:.4f}")
             stat_tile("Elapsed", duration(s.start_time, s.end_time), "timer")
+
+        self._render_running(s)
 
         if history:
             options = _curve_options(history, s.metrics)
@@ -372,6 +398,24 @@ class SessionsPanel:
                 self._empty_state("show_chart", "Waiting for the first epoch to finish...")
 
         self._tail_log(s.log_file, log_size)
+
+    def _render_running(self, s: SessionInfo):
+        """One row per trial in progress (parallel searches), with its GPUs and epochs."""
+        self.running_box.visible = bool(s.running_trials) and s.status == "running"
+        self.running_box.clear()
+        if not self.running_box.visible:
+            return
+        index = {g["uuid"]: g["index"] for g in s.config.get("gui", {}).get("gpus", [])}
+        with self.running_box:
+            ui.label("Running trials").classes("text-sm font-semibold")
+            for name, trial in sorted(s.running_trials.items(), key=lambda kv: int(re.sub(r"\D", "", kv[0]) or 0)):
+                epoch, epochs = trial.get("epoch", 0), trial.get("epochs")
+                gpus = ", ".join(str(index.get(g, g)) for g in trial.get("gpus", []))
+                with ui.row().classes("items-center w-full no-wrap gap-3"):
+                    ui.label(name).classes("am-mono text-sm w-20 shrink-0")
+                    ui.chip(f"GPU {gpus}", icon="memory", color="grey-7").props("outline dense").classes("shrink-0")
+                    ui.linear_progress(epoch / epochs if epochs else 0, show_value=False, size="6px").classes("grow rounded")
+                    ui.label(f"epoch {epoch}/{epochs}" if epochs else "starting").classes("text-xs am-mono am-muted w-24 text-right shrink-0")
 
     def _tail_log(self, log_file: str, size: int):
         if self.log_view is None or not log_file or size <= self._log_pos:

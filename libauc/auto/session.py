@@ -1,8 +1,8 @@
 """
 Session-aware AutoMAX subclass bridging the SMAC search loop with the GUI's
-SessionManager, without modifying :mod:`libauc.auto.automax` itself.
+SessionManager.
 """
-from typing import Optional, TYPE_CHECKING
+from typing import List, Optional, TYPE_CHECKING
 
 from .automax import AutoMAX
 from .configuration import AutoMAXConfigration
@@ -33,10 +33,11 @@ class SessionAwareAutoMAX(AutoMAX):
     """
     AutoMAX subclass that reports trial-level progress to a SessionManager.
 
-    ``AutoMAX`` has no trial-begin/trial-end hook -- SMAC calls
-    ``self.train`` as a bare objective function per trial. This subclass
-    wraps ``train()`` with before/after session updates instead of adding a
-    trial-level callback abstraction to AutoMAX itself.
+    One trial at a time, SMAC calls ``self.train`` per trial, which this
+    subclass wraps with before/after session updates. In a parallel search
+    trials run in their own processes instead, so it uses AutoMAX's parallel
+    hooks (``_on_parallel_trial_start`` / ``_end``, ``_check_stop``), and each
+    trial's ``SessionCallback`` reports its epochs.
     """
 
     def __init__(
@@ -48,12 +49,6 @@ class SessionAwareAutoMAX(AutoMAX):
         session_id: str,
         session_callback: Optional["SessionCallback"] = None,
     ):
-        if config.is_parallel:
-            # Progress/cancel reporting hooks into train(), which only runs
-            # in-process; parallel trials run in separate worker processes.
-            raise ValueError(
-                "GUI sessions run one trial at a time; n_workers and gpus_per_trial must be 1."
-            )
         super().__init__(trainer, config, target)
         self.session_manager = session_manager
         self.session_id = session_id
@@ -64,6 +59,33 @@ class SessionAwareAutoMAX(AutoMAX):
             automax_output_directory=config.output_directory,
             automax_name=config.name,
         )
+
+    # -- parallel search ------------------------------------------------------
+
+    def _check_stop(self):
+        session = self.session_manager.get_session(self.session_id)
+        if session is None or session.status == "cancelled":
+            raise TrainingCancelled(f"Session {self.session_id} was cancelled by the user")
+
+    def _on_parallel_trial_start(self, trial_name: str, gpus: List[str]):
+        self.session_manager.update_trial(self.session_id, trial_name, gpus=list(gpus), epoch=0)
+        self.session_manager.write_session_log(
+            self.session_id, f"Starting {trial_name} on GPU(s) {', '.join(gpus)}"
+        )
+
+    def _on_parallel_trial_end(self, trial_name: str, ok: bool, is_best: bool):
+        self.session_manager.update_session(self.session_id, trial=self.completed)
+        self.session_manager.update_trial(self.session_id, trial_name, finished=True)
+        predictions = self.session_manager.load_trial_predictions(self.session_id, trial_name)
+        if ok and is_best and predictions:
+            self.session_manager.update_session(self.session_id, **predictions)
+        self.session_manager.write_session_log(
+            self.session_id,
+            f"Finished {trial_name} [{self.completed}/{self.config.n_trials}]" if ok else f"{trial_name} crashed",
+            level="INFO" if ok else "ERROR",
+        )
+
+    # -- one trial at a time ----------------------------------------------------
 
     def train(self, space, seed: int = 0) -> float:
         trial_num = self.completed + 1

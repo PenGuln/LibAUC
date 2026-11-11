@@ -78,6 +78,12 @@ def run(cfg_dict: dict, session_id: str) -> None:
         logger.exception(f"Session {session_id} failed")
         raise
     else:
+        if tuner.completed == 0:
+            # AutoMAX stops after repeated crashes without raising.
+            message = f"All {tuner.crashed} trial(s) crashed; see the log and the trial logs"
+            session_manager.complete_session(session_id, error_message=message)
+            logger.error(f"Session {session_id} failed: {message}")
+            return
         session_manager.complete_session(session_id)
         logger.info(f"Session {session_id} completed successfully")
     finally:

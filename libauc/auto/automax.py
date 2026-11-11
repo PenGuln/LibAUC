@@ -8,7 +8,7 @@ import sys
 import time
 import traceback
 import logging
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional
 from smac import HyperparameterOptimizationFacade, Scenario
 from smac.initial_design import DefaultInitialDesign
 from .configuration import AutoMAXConfigration
@@ -335,6 +335,18 @@ class AutoMAX:
             self.smac.tell(info, TrialValue(cost=cost, time=time.time() - start, status=status))
         return self.smac.intensifier.get_incumbent()
 
+    # Hooks for the parallel loop, used by the GUI's SessionAwareAutoMAX. The
+    # serial loop goes through train(), which subclasses can override instead.
+
+    def _check_stop(self):
+        """Called between parallel trials; raise to abort the search."""
+
+    def _on_parallel_trial_start(self, trial_name: str, gpus: List[str]):
+        """Called after a parallel trial has started on ``gpus``."""
+
+    def _on_parallel_trial_end(self, trial_name: str, ok: bool, is_best: bool):
+        """Called after a parallel trial's result (or crash) was recorded."""
+
     def _optimize_parallel(self):
         """Ask/tell loop running up to ``n_workers`` trials concurrently."""
         cfg = self.config
@@ -355,14 +367,17 @@ class AutoMAX:
         try:
             while pending or resubmit or self._budget_left():
                 while pool.has_free_slot() and (resubmit or self._budget_left(len(pending))):
+                    self._check_stop()
                     info = resubmit.pop(0) if resubmit else self.smac.ask()
                     trial_name = self._trial_name(info.config)
                     gpus, log_path = pool.submit(trial_name, dict(info.config), trial_name)
                     pending[trial_name] = info
                     logger.info(f"Started {trial_name} on GPU(s) {gpus}: {dict(info.config)} (log: {log_path})")
+                    self._on_parallel_trial_start(trial_name, gpus)
 
                 outcome = pool.wait()
                 info = pending.pop(outcome.key)
+                self._check_stop()  # before retrying: a cancel makes trials crash too
                 if not outcome.ok and attempts.get(outcome.key, 0) < cfg.trial_retries and not self._gave_up:
                     # Often an environment problem (out of memory, a wiped /dev/shm); the
                     # trial resumes from its own checkpoints when the recipe allows it.
@@ -371,6 +386,7 @@ class AutoMAX:
                                    f"restarting it (retry {attempts[outcome.key]}/{cfg.trial_retries}):\n{outcome.error}")
                     resubmit.insert(0, info)
                     continue
+                previous_best = self.best_score
                 if outcome.ok:
                     cost = self._record_result(info.config, outcome.key, outcome.result)
                     status = StatusType.SUCCESS
@@ -384,6 +400,7 @@ class AutoMAX:
                     logger.error(f"{outcome.key} crashed after {outcome.elapsed:.0f}s "
                                  f"(see {outcome.log_path}):\n{outcome.error}")
                 self.smac.tell(info, TrialValue(cost=cost, time=outcome.elapsed, status=status))
+                self._on_parallel_trial_end(outcome.key, outcome.ok, self.best_score > previous_best)
         finally:
             pool.shutdown()
 
